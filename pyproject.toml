@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tc-scheduler"
+version = "0.2.0"
+description = "Decide o que a estação terrestre SpaceLab rastreia, e quando"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Flask é novo aqui, e não é extra: servir o plano por HTTP passou a ser parte
+# do que este serviço é. Quem escreve o banco é quem o serve.
+#
+# A tag da spacelab-tracking precisa bater com a do grs-station-manager: o
+# payload de `track_satellite` no ZMQ 5580 é OrbitalData.to_json(), e os dois
+# lados desserializam com a versão que instalaram.
+dependencies = [
+    "spacelab-tracking @ git+https://github.com/nanosat-gs/spacelab-tracking@v0.1.0",
+    "SQLAlchemy>=2.0,<3.0",
+    "psycopg2-binary>=2.9",
+    "pyzmq>=25,<26",
+    "Flask>=3.0,<4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

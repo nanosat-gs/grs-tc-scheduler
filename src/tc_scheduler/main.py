@@ -36,7 +36,7 @@ from spacelab_tracking import (
     satellite_epoch,
 )
 
-from tc_scheduler import config, db
+from tc_scheduler import config, db, schema_check
 from tc_scheduler.planner import PassCandidate, is_worth_tracking, select_passes
 from tc_scheduler.station_manager import (
     StationManagerClient,
@@ -341,6 +341,11 @@ def main() -> None:
     )
 
     engine = db.build_engine(config.DATABASE_URL)
+    # O schema é propriedade do TC Generator, noutro repositório, sem
+    # migrations ligando os dois. Conferir aqui converte um ProgrammingError
+    # no meio de um ciclo (logado como "Falha no ciclo do scheduler", a
+    # mensagem mais genérica possível) numa linha explícita no boot.
+    schema_check.check(engine)
     station = StationManagerClient(
         config.STATION_MANAGER_ADDRESS, config.ZMQ_REQUEST_TIMEOUT_MS
     )
