@@ -2,7 +2,7 @@
 
 O TC Scheduler é o único serviço que **escreve** no banco da estação. Mas o
 banco não é dele: o schema é criado pelo
-[TC Generator](https://github.com/edsoncepedi/grs-tc-generator), em
+[TC Generator](https://github.com/nanosat-gs/grs-tc-generator), em
 `resources/database/schema.sql`, montado pelo compose do orquestrador em
 `/docker-entrypoint-initdb.d/`.
 
