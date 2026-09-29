@@ -71,14 +71,23 @@ class StationManagerClient:
     # --- Rastreamento autônomo ---------------------------------------------
 
     def track_satellite(self, orbital_data: dict, until_iso: str,
-                        satellite_name: Optional[str] = None) -> dict[str, Any]:
-        """Entrega a passagem inteira ao Station Manager, numa ordem só."""
-        reply = self._request({
+                        satellite_name: Optional[str] = None,
+                        downlink_frequency_hz: Optional[float] = None) -> dict[str, Any]:
+        """Entrega a passagem inteira ao Station Manager, numa ordem só.
+
+        Com `downlink_frequency_hz`, o Station Manager anuncia a portadora e o
+        Doppler do satélite para o caminho de recepção. Sem ela, rastreia igual,
+        só sem anúncio de sintonia.
+        """
+        message = {
             "cmd": "track_satellite",
             "orbital_data": orbital_data,
             "until": until_iso,
             "satellite_name": satellite_name,
-        })
+        }
+        if downlink_frequency_hz is not None:
+            message["downlink_frequency_hz"] = downlink_frequency_hz
+        reply = self._request(message)
         return reply["tracking"]
 
     def get_tracking(self) -> Optional[dict[str, Any]]:

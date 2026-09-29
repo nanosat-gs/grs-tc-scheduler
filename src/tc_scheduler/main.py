@@ -24,7 +24,7 @@ import logging
 import signal
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from spacelab_tracking import (
@@ -37,7 +37,12 @@ from spacelab_tracking import (
 )
 
 from tc_scheduler import config, db, schema_check
-from tc_scheduler.planner import PassCandidate, is_worth_tracking, select_passes
+from tc_scheduler.planner import (
+    PassCandidate,
+    is_worth_tracking,
+    mark_telecommand_carriers,
+    plan_passes,
+)
 from tc_scheduler.station_manager import (
     StationManagerClient,
     StationManagerError,
@@ -64,12 +69,49 @@ def load_orbital_data(satellite: dict):
     return get_orbital_data(satellite["norad_id"])
 
 
+def _prediction_row(candidate: PassCandidate, outcome: str,
+                    lost_to: Optional[PassCandidate], telecommand_count: int) -> dict:
+    satellite_pass = candidate.satellite_pass
+    return {
+        "satellite_id": candidate.satellite_id,
+        "aos_time": satellite_pass.aos_time,
+        "los_time": satellite_pass.los_time,
+        "culmination_time": getattr(satellite_pass, "culmination_time", None),
+        "max_elevation_deg": satellite_pass.max_elevation_deg,
+        "outcome": outcome,
+        "lost_to_satellite_id": lost_to.satellite_id if lost_to else None,
+        "lost_to_aos_time": lost_to.satellite_pass.aos_time if lost_to else None,
+        "forced": candidate.forced,
+        "carries_telecommands": candidate.carries_telecommands,
+        "telecommand_count": telecommand_count,
+    }
+
+
+def find_decision(decisions: list[dict], satellite_id: int, aos: datetime) -> Optional[str]:
+    """A decisão do operador para esta passagem, se houver.
+
+    Casada por satélite + AOS previsto dentro da tolerância, e não pelo id da
+    linha: o plano é apagado e recriado a cada ciclo. Havendo mais de uma, vale
+    a de AOS mais próximo.
+    """
+    matches = [
+        d for d in decisions
+        if d["satellite_id"] == satellite_id
+        and abs(d["predicted_aos"] - aos) <= db.PASS_MATCH_TOLERANCE
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda d: abs(d["predicted_aos"] - aos))["decision"]
+
+
 class Scheduler:
     def __init__(self, engine, station: StationManagerClient) -> None:
         self._engine = engine
         self._station = station
         self._last_replan = 0.0
         self._last_tracking_poll = 0.0
+        self._last_control_check = 0.0
+        self._control_version: Optional[tuple] = None
         self._running = True
 
     def stop(self, *_: object) -> None:
@@ -79,20 +121,29 @@ class Scheduler:
     # --- Planejamento -------------------------------------------------------
 
     def replan(self) -> None:
-        """Recalcula o plano: prevê passagens, escolhe e compromete comandos."""
+        """Recalcula o plano: prevê passagens, escolhe e compromete comandos.
+
+        Toda passagem aproveitável de satélite ativo é candidata, tenha
+        telecomando ou não — o satélite transmite telemetria sem esperar
+        uplink. Satélite com a recepção desligada pelo operador volta ao
+        comportamento antigo: só a passagem que leva telecomando.
+        """
         started = time.perf_counter()
+        now = now_utc()
 
         with self._engine.begin() as conn:
-            satellites = db.fetch_trackable_satellites(conn)
+            satellites = db.fetch_candidate_satellites(conn)
+            db.prune_pass_decisions(conn, before=now - timedelta(hours=6))
+            decisions = db.fetch_pass_decisions(conn, since=now - timedelta(hours=6))
 
         if not satellites:
             logger.info(
-                "Nada a planejar: nenhum satélite ativo com telecomando pendente "
-                "e dado orbital. Preencha satellites.norad_id para habilitar o "
-                "agendamento automático."
+                "Nada a planejar: nenhum satélite ativo com dado orbital. Preencha "
+                "satellites.norad_id para habilitar o agendamento automático."
             )
 
         candidates: list[PassCandidate] = []
+        reception_off: list[tuple] = []   # (satélite, passagem): só para mostrar
         for satellite in satellites:
             try:
                 orbital_data = load_orbital_data(satellite.__dict__)
@@ -117,13 +168,14 @@ class Scheduler:
             ]
             logger.info(
                 "%s: %d passagens em %.0fh, %d aproveitáveis (%d telecomandos, "
-                "prioridade máx. %d)",
+                "prioridade máx. %d, recepção %s)",
                 satellite.name, len(passes), config.HORIZON_HOURS, len(usable),
                 satellite.pending_telecommands, satellite.max_priority,
+                "ligada" if satellite.track_passes else "desligada",
             )
 
             epoch = satellite_epoch(satrec)
-            candidates.extend(
+            satellite_candidates = [
                 PassCandidate(
                     satellite_id=satellite.id,
                     satellite_name=satellite.name,
@@ -132,16 +184,37 @@ class Scheduler:
                     max_priority=satellite.max_priority,
                     tle_epoch=epoch,
                     data_source=orbital_data.source,
+                    forced=find_decision(decisions, satellite.id, p.aos_time) == "force",
+                    skipped=find_decision(decisions, satellite.id, p.aos_time) == "skip",
                 )
                 for p in usable
-            )
+            ]
+            satellite_candidates = mark_telecommand_carriers(satellite_candidates)
 
-        selected = select_passes(candidates)
+            if satellite.track_passes:
+                candidates.extend(satellite_candidates)
+                continue
+
+            # Recepção desligada: só disputa o rotor a passagem que leva
+            # telecomando (ou a que o operador forçou). As outras ficam na
+            # previsão, marcadas, para o operador ver o que está deixando de
+            # rastrear.
+            for candidate in satellite_candidates:
+                if candidate.carries_telecommands or candidate.forced:
+                    candidates.append(candidate)
+                else:
+                    reception_off.append(candidate)
+
+        outcomes = plan_passes(candidates)
+        telecommand_count: dict[int, int] = {}
 
         committed = 0
         with self._engine.begin() as conn:
             db.clear_planned_passes(conn)
-            for candidate in selected:
+            for outcome in outcomes:
+                if outcome.outcome != "planned":
+                    continue
+                candidate = outcome.candidate
                 pass_id = db.insert_planned_pass(
                     conn, candidate.satellite_id, candidate.satellite_pass,
                     candidate.tle_epoch, candidate.data_source,
@@ -149,32 +222,48 @@ class Scheduler:
                 assigned = db.assign_telecommands_to_pass(
                     conn, pass_id, candidate.satellite_id
                 )
-                if assigned == 0:
-                    # A passagem anterior do mesmo satélite já levou tudo o que
-                    # havia na fila. Mover a antena para não transmitir nada só
-                    # gasta desgaste — quando houver downlink de telemetria a
-                    # decidir, esta regra precisa ser revista.
-                    db.delete_pass(conn, pass_id)
-                    logger.debug(
-                        "Passagem de %s em %s descartada: nada a transmitir.",
-                        candidate.satellite_name,
-                        candidate.satellite_pass.aos_time.isoformat(),
-                    )
-                    continue
-
+                telecommand_count[id(candidate)] = assigned
                 committed += 1
                 logger.info(
-                    "Agendado: %s AOS %s (el.máx %.1f graus), %d telecomandos",
+                    "Agendado: %s AOS %s (el.máx %.1f graus), %s",
                     candidate.satellite_name,
                     candidate.satellite_pass.aos_time.isoformat(),
                     candidate.satellite_pass.max_elevation_deg,
-                    assigned,
+                    f"{assigned} telecomandos" if assigned else "só recepção",
                 )
+
+            db.replace_pass_predictions(
+                conn,
+                [_prediction_row(o.candidate, o.outcome, o.lost_to,
+                                 telecommand_count.get(id(o.candidate), 0))
+                 for o in outcomes]
+                + [_prediction_row(c, "reception_off", None, 0) for c in reception_off],
+                computed_at=now,
+            )
 
         logger.info(
             "Plano atualizado: %d passagens comprometidas de %d candidatas (%.2fs)",
             committed, len(candidates), time.perf_counter() - started,
         )
+
+    def replan_if_operator_changed(self) -> None:
+        """Replaneja logo depois de uma ação do operador no painel.
+
+        A API grava a decisão no banco (outra thread, sem memória
+        compartilhada); este laço percebe pela versão das tabelas de controle.
+        Sem isso, pular uma passagem só apareceria no próximo ciclo, até 5
+        minutos depois.
+        """
+        with self._engine.begin() as conn:
+            version = db.control_version(conn)
+        if self._control_version is None:
+            self._control_version = version
+            return
+        if version != self._control_version:
+            self._control_version = version
+            logger.info("Decisão do operador registrada; replanejando.")
+            self._last_replan = time.monotonic()
+            self.replan()
 
     # --- Posição corrente ---------------------------------------------------
 
@@ -258,6 +347,7 @@ class Scheduler:
                 orbital_data.to_json(),
                 until_iso=scheduled_pass["los_time"].isoformat(),
                 satellite_name=name,
+                downlink_frequency_hz=scheduled_pass.get("downlink_frequency_hz"),
             )
         except (StationManagerUnavailable, StationManagerError) as error:
             # Não marca 'missed' aqui: a janela ainda está aberta, e o próximo
@@ -314,6 +404,9 @@ class Scheduler:
                 if cycle_started - self._last_replan >= config.REPLAN_INTERVAL_SECONDS:
                     self._last_replan = cycle_started
                     self.replan()
+                elif cycle_started - self._last_control_check >= config.CONTROL_POLL_SECONDS:
+                    self._last_control_check = cycle_started
+                    self.replan_if_operator_changed()
 
                 if cycle_started - self._last_tracking_poll >= config.TRACKING_POLL_INTERVAL_SECONDS:
                     self._last_tracking_poll = cycle_started
@@ -341,6 +434,9 @@ def main() -> None:
     )
 
     engine = db.build_engine(config.DATABASE_URL)
+    # As tabelas de controle de passagens são nossas: criadas aqui, antes de a
+    # API subir, porque ela lê e escreve nelas.
+    db.ensure_control_schema(engine)
     # O schema é propriedade do TC Generator, noutro repositório, sem
     # migrations ligando os dois. Conferir aqui converte um ProgrammingError
     # no meio de um ciclo (logado como "Falha no ciclo do scheduler", a
@@ -380,13 +476,17 @@ def _start_api():
     rastrear é o principal.
     """
     from tc_scheduler import api, station_data as station_data_module
+    from tc_scheduler.operator_control import OperatorControl
 
     try:
         data = station_data_module.from_environment()
         if data is None:
             return None
+        # Engine próprio também para o controle do operador: a leitura do
+        # painel e as ações dele não disputam o mesmo pool de duas conexões.
+        control = OperatorControl(db.build_engine(config.DATABASE_URL))
         thread = threading.Thread(
-            target=api.create_app(data).run,
+            target=api.create_app(data, control).run,
             # threaded=True: sem isso, uma consulta lenta ao banco travaria
             # qualquer outra requisição, inclusive o healthcheck do compose.
             kwargs={"host": config.API_HOST, "port": config.API_PORT,

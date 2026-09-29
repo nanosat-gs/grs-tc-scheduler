@@ -8,24 +8,57 @@ quiser lê-lo.
 
 | Porta | Protocolo | Direção |
 |---|---|---|
-| 5591 | HTTP (Flask) | **expõe** — API de leitura; quem consome é o GRS Manager |
+| 5591 | HTTP (Flask) | **expõe** — API do plano e das ações do operador; quem consome é o GRS Manager. No compose, publicada só em `127.0.0.1` (a API escreve e não tem autenticação) |
 | 5580 | ZMQ REQ | **consome** — [Station Manager](https://github.com/nanosat-gs/grs-station-manager) |
 | 5432 | Postgres | **consome** — o banco do TC Generator |
 
 ## Como a autonomia funciona
 
-Pontua as passagens por **prioridade do telecomando à espera → quantidade de
-comandos → elevação máxima**, e escolhe as que não se sobrepõem (a estação tem
-um rotor só). Manda **uma ordem por passagem** (`track_satellite`) ao Station
-Manager, não um setpoint por segundo: planejar é lento e apontar é rápido, e
-separá-los faz com que um replanejamento nunca atrase o rotor.
+**Toda passagem é candidata**, tenha telecomando ou não: o satélite transmite
+telemetria sem esperar uplink, e a correção de Doppler só atua numa passagem
+rastreada. Pontua por **forçada pelo operador → prioridade do telecomando à
+espera → quantidade de comandos → elevação máxima**, e escolhe as que não se
+sobrepõem (a estação tem um rotor só). O peso de telecomando vale só na
+**primeira passagem não pulada** de cada satélite, que é a que leva a fila
+inteira; as seguintes disputam como recepção (`mark_telecommand_carriers`).
+
+Manda **uma ordem por passagem** (`track_satellite`) ao Station Manager, não um
+setpoint por segundo: planejar é lento e apontar é rápido, e separá-los faz com
+que um replanejamento nunca atrase o rotor. Com frequência de downlink
+cadastrada, a ordem a leva junto, e o Station Manager anuncia portadora e
+Doppler ao caminho de recepção.
+
+## Controle do operador sobre passagens
+
+O operador age pelo painel do GRS Manager, que repassa para `api.py`
+(`operator_control.py`). Três coisas, guardadas no schema **`mission_control`**,
+que é deste serviço (criado no boot por `db.ensure_control_schema`):
+
+| Tabela | O quê |
+|---|---|
+| `satellite_reception` | Por satélite: `track_passes` (padrão ligado; sem linha = padrão) e `downlink_frequency_hz` |
+| `pass_decisions` | `skip` ou `force` numa passagem. Desfazer = apagar a linha |
+| `pass_predictions` | Resultado do último replanejamento, **todas** as candidatas: `planned`, `conflict` (com quem venceu), `skipped`, `reception_off`. É como a API mostra as que perderam sem compartilhar memória com o laço |
+
+**A passagem é identificada por satélite + AOS previsto**, casados com
+tolerância de ±10 min (`PASS_MATCH_TOLERANCE`) — nunca pelo id: as linhas
+`planned` são apagadas e recriadas a cada replanejamento. Passagens seguidas do
+mesmo satélite distam ~90 min, e uma TLE nova desloca o AOS em segundos.
+
+O laço confere a cada `SCHEDULER_CONTROL_POLL_SECONDS` (5 s) se as tabelas de
+controle mudaram (`control_version`) e replaneja na hora: a ação aparece na
+tela em segundos, sem esperar o ciclo de 5 min.
+
+Com `track_passes` desligado, o satélite volta ao comportamento antigo: só
+entra a passagem que leva telecomando, ou a que o operador forçou.
 
 ## O único escritor do banco
 
-Essa regra é a razão de a API de leitura existir. Antes, o painel do GRS
-Manager abria a própria conexão com o Postgres para mostrar satélites e
-passagens — dois serviços de repositórios diferentes escrevendo raw SQL contra
-o mesmo schema. Agora quem escreve é quem serve.
+Essa regra é a razão de a API existir. Antes, o painel do GRS Manager abria a
+própria conexão com o Postgres para mostrar satélites e passagens — dois
+serviços de repositórios diferentes escrevendo raw SQL contra o mesmo schema.
+Agora quem escreve é quem serve, inclusive as ações do operador: o painel as
+manda para cá em vez de abrir conexão própria.
 
 `station_data.py` faz a leitura, `api.py` a expõe. Os caminhos são os mesmos
 que o painel já servia, para que o cliente do outro lado seja um repasse de URL.
@@ -44,12 +77,22 @@ a saída é um serviço a mais no compose, mesma imagem, sem tocar em código.
 
 ## Armadilhas
 
-- **Satélite sem telecomando à espera não entra no plano.**
-  `fetch_trackable_satellites` usa `JOIN telecommands`, não `LEFT JOIN`: sem
-  nada a transmitir não há o que agendar. Ele continua aparecendo no painel com
-  posição, porque a posição corrente vem de outra consulta, sem esse filtro.
-  Cadastrar um satélite e estranhar que não há passagem planejada costuma ser
-  isto.
+- **Satélite sem passagem no plano: confira a recepção.** Todo satélite
+  `active` com dado orbital entra (`fetch_candidate_satellites`), a menos que o
+  operador tenha desligado `track_passes` — aí só entra com telecomando. A aba
+  Previsão do painel mostra o motivo de cada passagem (`reception_off`,
+  `conflict`, `skipped`).
+- **`scheduled_passes` só tem as escolhidas.** As que perderam o conflito vivem
+  em `mission_control.pass_predictions`. Quem lê só `scheduled_passes` não vê
+  por que uma passagem sumiu.
+- **`CREATE TABLE IF NOT EXISTS` não adiciona coluna.** Mudar as tabelas de
+  `mission_control` exige `ALTER TABLE` à mão num banco existente;
+  `schema_check.py` avisa no boot quando falta coluna.
+- **`load_orbital_data` lê `satellite["name"]`.** As consultas de ativação
+  (`fetch_pass_to_activate`, `fetch_active_pass`) precisam trazer `s.name`, não
+  só o alias `satellite_name`: sem ela, todo satélite com TLE manual tinha a
+  passagem cancelada com KeyError no AOS (os com NORAD ID passavam por outro
+  caminho).
 - **O plano ignora passagens rasantes.** `is_worth_tracking` corta abaixo de
   `SCHEDULER_MIN_PASS_ELEVATION_DEG` (5°) ou 60 s. Um cliente com máscara em 0°
   vai listar passagens que a estação decidiu não rastrear — é diferença de
@@ -73,6 +116,10 @@ a saída é um serviço a mais no compose, mesma imagem, sem tocar em código.
 ```bash
 pip install -e ".[dev]"
 pytest
+
+# Testes contra Postgres de verdade (criam e apagam um banco descartável):
+SCHEDULER_TEST_DATABASE_URL=postgresql+psycopg2://admin:admin@localhost:5432/tc_generator \
+TC_GENERATOR_SCHEMA_SQL=../grs-tc-generator/resources/database/schema.sql pytest
 
 python -m tc_scheduler.main            # laço + API
 python -m tc_scheduler.main --no-api   # só o laço

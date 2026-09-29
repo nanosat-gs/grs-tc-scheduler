@@ -114,3 +114,115 @@ def test_refresh_chama_a_revalidacao_e_so_por_post(client_for):
     assert response.status_code == 200
     assert response.get_json()["updated"] == 3
     assert station_data.refresh_calls == 1
+
+
+# --- Controle do operador -------------------------------------------------------
+
+from tc_scheduler.operator_control import ControlError, NotFound  # noqa: E402
+
+
+class FakeControl:
+    """Dublê do OperatorControl: registra as chamadas e imita os erros reais."""
+
+    def __init__(self, fail_with=None):
+        self.calls = []
+        self._fail_with = fail_with
+
+    def predictions(self):
+        if self._fail_with:
+            raise self._fail_with
+        return {"computed_at": None, "passes": [{"satellite_code": "SAT-1"}], "reception": []}
+
+    def set_reception(self, code, changes):
+        self.calls.append(("reception", code, changes))
+        if code == "NAO-EXISTE":
+            raise NotFound(f"satélite {code} não encontrado")
+        if changes == {"track_passes": "sim"}:
+            raise ControlError("track_passes precisa ser true ou false")
+        return {"code": code, "track_passes": True, "downlink_frequency_hz": None}
+
+    def set_decision(self, code, aos, decision):
+        self.calls.append(("decision", code, aos, decision))
+
+
+@pytest.fixture
+def control_client():
+    def build(control):
+        app = create_app(FakeStationData(), control)
+        app.config.update(TESTING=True)
+        return app.test_client()
+
+    return build
+
+
+def test_passes_devolve_a_previsao(control_client):
+    response = control_client(FakeControl()).get("/api/passes")
+
+    assert response.status_code == 200
+    assert response.get_json()["passes"] == [{"satellite_code": "SAT-1"}]
+
+
+def test_sem_controle_as_rotas_do_operador_dao_503_e_a_leitura_segue(client_for):
+    client = client_for(FakeStationData())
+
+    assert client.get("/api/passes").status_code == 503
+    assert client.put("/api/passes/decision", json={}).status_code == 503
+    assert client.get("/api/station").status_code == 200
+
+
+def test_banco_fora_vira_503_e_nao_500(control_client):
+    response = control_client(FakeControl(fail_with=RuntimeError("conexão recusada"))).get("/api/passes")
+
+    assert response.status_code == 503
+    assert response.get_json() == {"error": "banco indisponível"}
+
+
+def test_recepcao_repassa_os_campos(control_client):
+    control = FakeControl()
+    response = control_client(control).put(
+        "/api/satellites/SAT-1/reception",
+        json={"track_passes": False, "downlink_frequency_hz": 145_900_000},
+    )
+
+    assert response.status_code == 200
+    assert control.calls == [("reception", "SAT-1",
+                              {"track_passes": False, "downlink_frequency_hz": 145_900_000})]
+
+
+def test_recepcao_invalida_e_400_com_a_mensagem(control_client):
+    response = control_client(FakeControl()).put(
+        "/api/satellites/SAT-1/reception", json={"track_passes": "sim"})
+
+    assert response.status_code == 400
+    assert "track_passes" in response.get_json()["error"]
+
+
+def test_recepcao_de_satelite_inexistente_e_404(control_client):
+    response = control_client(FakeControl()).put(
+        "/api/satellites/NAO-EXISTE/reception", json={"track_passes": True})
+
+    assert response.status_code == 404
+
+
+def test_decisao_repassa_satelite_aos_e_decisao(control_client):
+    control = FakeControl()
+    response = control_client(control).put("/api/passes/decision", json={
+        "satellite_code": "SAT-1", "aos": "2026-09-29T14:03:00Z", "decision": "skip"})
+
+    assert response.status_code == 200
+    assert control.calls == [("decision", "SAT-1", "2026-09-29T14:03:00Z", "skip")]
+
+
+def test_desfazer_decisao_e_decision_null(control_client):
+    control = FakeControl()
+    control_client(control).put("/api/passes/decision", json={
+        "satellite_code": "SAT-1", "aos": "2026-09-29T14:03:00Z", "decision": None})
+
+    assert control.calls[0][3] is None
+
+
+@pytest.mark.parametrize("body", [None, [], {"aos": "x", "decision": "skip"}])
+def test_decisao_sem_os_campos_e_400(control_client, body):
+    response = control_client(FakeControl()).put("/api/passes/decision", json=body)
+
+    assert response.status_code == 400

@@ -35,6 +35,10 @@ TICK_SECONDS = float(os.getenv("SCHEDULER_TICK_SECONDS", "1"))
 REPLAN_INTERVAL_SECONDS = float(os.getenv("SCHEDULER_REPLAN_INTERVAL_SECONDS", "300"))
 HORIZON_HOURS = float(os.getenv("SCHEDULER_HORIZON_HOURS", "24"))
 
+# Com que frequência o laço confere se o operador mudou uma decisão de
+# passagem ou a recepção de um satélite — e replaneja na hora se mudou.
+CONTROL_POLL_SECONDS = float(os.getenv("SCHEDULER_CONTROL_POLL_SECONDS", "5"))
+
 # Atualização da posição corrente de cada satélite no banco (visão do painel).
 TRACKING_POLL_INTERVAL_SECONDS = float(os.getenv("TRACKING_POLL_INTERVAL_SECONDS", "30"))
 

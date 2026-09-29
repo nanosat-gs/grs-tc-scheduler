@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import create_engine, text
@@ -21,8 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class TrackableSatellite:
-    """Satélite que a estação consegue rastrear e que tem trabalho pendente."""
+class CandidateSatellite:
+    """Satélite ativo com órbita conhecida, e o que se quer dele.
+
+    `track_passes` é a escolha do operador: rastrear toda passagem para
+    receber telemetria (padrão), ou só as que levam telecomando.
+    """
 
     id: int
     name: str
@@ -32,10 +36,92 @@ class TrackableSatellite:
     tle_line2: Optional[str]
     pending_telecommands: int
     max_priority: int
+    track_passes: bool
+    downlink_frequency_hz: Optional[float]
 
     @property
     def has_manual_tle(self) -> bool:
         return bool(self.tle_line1 and self.tle_line2)
+
+
+# --- Tabelas do próprio Scheduler --------------------------------------------
+#
+# O schema `public` é do TC Generator (fork de terceiros, sem migrations). O
+# que o operador decide sobre passagens e recepção é do Scheduler — é ele quem
+# planeja — e mora no schema `mission_control`, criado aqui no boot com
+# `IF NOT EXISTS`, sem precisar de migração no repositório do outro.
+
+CONTROL_SCHEMA = "mission_control"
+
+# Tolerância para reconhecer "a mesma passagem" entre dois replanejamentos. O
+# plano é apagado e recriado a cada ciclo, então o id da linha não serve de
+# identidade: vale satélite + AOS previsto. Uma TLE nova desloca o AOS em
+# segundos; duas passagens do mesmo satélite distam ~90 min.
+PASS_MATCH_TOLERANCE = timedelta(minutes=10)
+
+_CONTROL_DDL = (
+    f"CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA}",
+    f"""
+    CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.satellite_reception (
+        satellite_id          INTEGER PRIMARY KEY REFERENCES satellites(id) ON DELETE CASCADE,
+        -- Sem linha para o satélite vale o padrão: rastrear toda passagem.
+        track_passes          BOOLEAN NOT NULL DEFAULT TRUE,
+        downlink_frequency_hz DOUBLE PRECISION
+            CHECK (downlink_frequency_hz IS NULL OR downlink_frequency_hz > 0),
+        updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.pass_decisions (
+        id            BIGSERIAL PRIMARY KEY,
+        satellite_id  INTEGER NOT NULL REFERENCES satellites(id) ON DELETE CASCADE,
+        predicted_aos TIMESTAMPTZ NOT NULL,
+        decision      TEXT NOT NULL CHECK (decision IN ('skip', 'force')),
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    f"CREATE INDEX IF NOT EXISTS pass_decisions_satellite_aos_idx "
+    f"ON {CONTROL_SCHEMA}.pass_decisions (satellite_id, predicted_aos)",
+    f"""
+    CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.pass_predictions (
+        id                   BIGSERIAL PRIMARY KEY,
+        satellite_id         INTEGER NOT NULL REFERENCES satellites(id) ON DELETE CASCADE,
+        aos_time             TIMESTAMPTZ NOT NULL,
+        los_time             TIMESTAMPTZ NOT NULL,
+        culmination_time     TIMESTAMPTZ,
+        max_elevation_deg    DOUBLE PRECISION NOT NULL,
+        outcome              TEXT NOT NULL
+            CHECK (outcome IN ('planned', 'conflict', 'skipped', 'reception_off')),
+        lost_to_satellite_id INTEGER,
+        lost_to_aos_time     TIMESTAMPTZ,
+        forced               BOOLEAN NOT NULL DEFAULT FALSE,
+        carries_telecommands BOOLEAN NOT NULL DEFAULT FALSE,
+        telecommand_count    INTEGER NOT NULL DEFAULT 0,
+        computed_at          TIMESTAMPTZ NOT NULL
+    )
+    """,
+)
+
+# Colunas das tabelas próprias, conferidas no boot pelo schema_check.
+CONTROL_COLUMNS: dict[str, tuple[str, ...]] = {
+    "satellite_reception": (
+        "satellite_id", "track_passes", "downlink_frequency_hz", "updated_at",
+    ),
+    "pass_decisions": ("id", "satellite_id", "predicted_aos", "decision", "created_at"),
+    "pass_predictions": (
+        "satellite_id", "aos_time", "los_time", "culmination_time", "max_elevation_deg",
+        "outcome", "lost_to_satellite_id", "lost_to_aos_time", "forced",
+        "carries_telecommands", "telecommand_count", "computed_at",
+    ),
+}
+
+
+def ensure_control_schema(engine: Engine) -> None:
+    """Cria as tabelas do Scheduler se faltarem. Idempotente: roda a cada boot."""
+    with engine.begin() as conn:
+        for statement in _CONTROL_DDL:
+            conn.execute(text(statement))
+    logger.info("Tabelas de controle de passagens prontas em %s.", CONTROL_SCHEMA)
 
 
 def build_engine(database_url: str) -> Engine:
@@ -64,27 +150,94 @@ _NEEDS_A_PASS = """
 """
 
 
-def fetch_trackable_satellites(conn: Connection) -> list[TrackableSatellite]:
-    """Satélites ativos, com dado orbital, e com telecomando esperando.
+def fetch_candidate_satellites(conn: Connection) -> list[CandidateSatellite]:
+    """Satélites ativos com dado orbital, com a fila e a escolha de recepção.
 
-    Sem telecomando esperando não há o que agendar; sem dado orbital não há como
-    prever passagem. Os dois filtros juntos definem o universo do planejamento.
+    Todos entram, tenham telecomando ou não: o satélite transmite telemetria
+    em toda passagem, sem esperar uplink. Antes o JOIN com telecomandos tirava
+    do plano quem não tinha comando na fila — e com ele a recepção.
+
+    Os de recepção desligada e sem comando também vêm: o planejamento não os
+    rastreia, mas mostra as passagens deles ao operador como "recepção
+    desligada", que é onde ele decide religar.
     """
     rows = conn.execute(text(f"""
         SELECT s.id, s.name, s.code, s.norad_id, s.tle_line1, s.tle_line2,
-               COUNT(t.id) AS pending_telecommands,
-               COALESCE(MAX(t.priority), 0) AS max_priority
+               COALESCE(tc.pending, 0) AS pending_telecommands,
+               COALESCE(tc.max_priority, 0) AS max_priority,
+               COALESCE(r.track_passes, TRUE) AS track_passes,
+               r.downlink_frequency_hz
         FROM satellites s
-        JOIN telecommands t
-          ON t.satellite_id = s.id
-         AND {_NEEDS_A_PASS}
+        LEFT JOIN (
+            SELECT t.satellite_id, COUNT(*) AS pending, MAX(t.priority) AS max_priority
+            FROM telecommands t
+            WHERE {_NEEDS_A_PASS}
+            GROUP BY t.satellite_id
+        ) tc ON tc.satellite_id = s.id
+        LEFT JOIN {CONTROL_SCHEMA}.satellite_reception r ON r.satellite_id = s.id
         WHERE s.status = 'active'
           AND (s.norad_id IS NOT NULL
                OR (s.tle_line1 IS NOT NULL AND s.tle_line2 IS NOT NULL))
-        GROUP BY s.id, s.name, s.code, s.norad_id, s.tle_line1, s.tle_line2
         ORDER BY s.id
     """)).mappings().all()
-    return [TrackableSatellite(**row) for row in rows]
+    return [CandidateSatellite(**row) for row in rows]
+
+
+def fetch_pass_decisions(conn: Connection, since: datetime) -> list[dict[str, Any]]:
+    """Decisões do operador (pular/forçar) para passagens ainda por vir."""
+    return [dict(row) for row in conn.execute(text(f"""
+        SELECT satellite_id, predicted_aos, decision
+        FROM {CONTROL_SCHEMA}.pass_decisions
+        WHERE predicted_aos >= :since
+        ORDER BY predicted_aos
+    """), {"since": since}).mappings().all()]
+
+
+def prune_pass_decisions(conn: Connection, before: datetime) -> int:
+    """Esquece decisões de passagens que já passaram — elas não decidem mais nada."""
+    return conn.execute(text(f"""
+        DELETE FROM {CONTROL_SCHEMA}.pass_decisions WHERE predicted_aos < :before
+    """), {"before": before}).rowcount
+
+
+def replace_pass_predictions(conn: Connection, rows: list[dict[str, Any]],
+                             computed_at: datetime) -> None:
+    """Troca a previsão inteira pela do replanejamento corrente.
+
+    Estado corrente, não histórico: a previsão anterior foi feita com outra
+    TLE e outra fila, e mantê-la ao lado confundiria o operador.
+    """
+    conn.execute(text(f"DELETE FROM {CONTROL_SCHEMA}.pass_predictions"))
+    if not rows:
+        return
+    conn.execute(text(f"""
+        INSERT INTO {CONTROL_SCHEMA}.pass_predictions (
+            satellite_id, aos_time, los_time, culmination_time, max_elevation_deg,
+            outcome, lost_to_satellite_id, lost_to_aos_time, forced,
+            carries_telecommands, telecommand_count, computed_at
+        ) VALUES (
+            :satellite_id, :aos_time, :los_time, :culmination_time, :max_elevation_deg,
+            :outcome, :lost_to_satellite_id, :lost_to_aos_time, :forced,
+            :carries_telecommands, :telecommand_count, :computed_at
+        )
+    """), [{**row, "computed_at": computed_at} for row in rows])
+
+
+def control_version(conn: Connection) -> tuple:
+    """Algo que muda sempre que o operador muda uma decisão ou a recepção.
+
+    Contagem e instante mais recente das duas tabelas: um INSERT muda o
+    instante, um DELETE muda a contagem. O laço compara isto a cada poucos
+    segundos para replanejar logo depois de uma ação do operador, sem esperar
+    o ciclo de 5 minutos e sem compartilhar memória com a thread da API.
+    """
+    row = conn.execute(text(f"""
+        SELECT (SELECT COUNT(*) FROM {CONTROL_SCHEMA}.pass_decisions),
+               (SELECT MAX(created_at) FROM {CONTROL_SCHEMA}.pass_decisions),
+               (SELECT COUNT(*) FROM {CONTROL_SCHEMA}.satellite_reception),
+               (SELECT MAX(updated_at) FROM {CONTROL_SCHEMA}.satellite_reception)
+    """)).one()
+    return tuple(row)
 
 
 def fetch_satellites_with_orbital_data(conn: Connection) -> list[dict[str, Any]]:
@@ -142,12 +295,22 @@ def fetch_station_overview(conn: Connection) -> dict[str, Any]:
 
 
 def fetch_pass_to_activate(conn: Connection, now: datetime) -> Optional[dict[str, Any]]:
-    """Passagem planejada cuja janela já começou e ainda não terminou."""
-    row = conn.execute(text("""
+    """Passagem planejada cuja janela já começou e ainda não terminou.
+
+    Traz a frequência de downlink do satélite, quando cadastrada: ela vai no
+    `track_satellite` para o Station Manager anunciar a sintonia.
+
+    `name` além de `satellite_name`: `load_orbital_data` lê `name` para montar
+    os dados de um TLE manual. Sem ele, todo satélite de TLE manual falhava
+    ao ser assumido e a passagem virava 'cancelled'.
+    """
+    row = conn.execute(text(f"""
         SELECT p.id, p.satellite_id, p.aos_time, p.los_time, p.max_elevation_deg,
-               s.name AS satellite_name, s.norad_id, s.tle_line1, s.tle_line2
+               s.name, s.name AS satellite_name, s.norad_id, s.tle_line1, s.tle_line2,
+               r.downlink_frequency_hz
         FROM scheduled_passes p
         JOIN satellites s ON s.id = p.satellite_id
+        LEFT JOIN {CONTROL_SCHEMA}.satellite_reception r ON r.satellite_id = s.id
         WHERE p.status = 'planned'
           AND p.aos_time <= :now
           AND p.los_time > :now
@@ -158,11 +321,13 @@ def fetch_pass_to_activate(conn: Connection, now: datetime) -> Optional[dict[str
 
 
 def fetch_active_pass(conn: Connection) -> Optional[dict[str, Any]]:
-    row = conn.execute(text("""
+    row = conn.execute(text(f"""
         SELECT p.id, p.satellite_id, p.aos_time, p.los_time,
-               s.name AS satellite_name, s.norad_id, s.tle_line1, s.tle_line2
+               s.name, s.name AS satellite_name, s.norad_id, s.tle_line1, s.tle_line2,
+               r.downlink_frequency_hz
         FROM scheduled_passes p
         JOIN satellites s ON s.id = p.satellite_id
+        LEFT JOIN {CONTROL_SCHEMA}.satellite_reception r ON r.satellite_id = s.id
         WHERE p.status = 'active'
         ORDER BY p.aos_time
         LIMIT 1

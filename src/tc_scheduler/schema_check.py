@@ -95,6 +95,46 @@ def check(engine) -> bool:
             )
             ok = False
 
+    ok = _check_control_tables(engine) and ok
+
     if ok:
         logger.info("Schema do banco confere com o que o Scheduler usa.")
+    return ok
+
+
+def _check_control_tables(engine) -> bool:
+    """As tabelas do próprio Scheduler (`mission_control`).
+
+    Criadas por `db.ensure_control_schema`, então a divergência aqui só vem de
+    uma versão mais nova do Scheduler subindo contra tabelas criadas por uma
+    antiga: `CREATE TABLE IF NOT EXISTS` não adiciona coluna.
+    """
+    from sqlalchemy import text
+
+    from tc_scheduler.db import CONTROL_COLUMNS, CONTROL_SCHEMA
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT table_name, column_name FROM information_schema.columns
+                WHERE table_schema = :schema AND table_name = ANY(:tables)
+            """), {"schema": CONTROL_SCHEMA, "tables": list(CONTROL_COLUMNS)}).fetchall()
+    except Exception as error:
+        logger.warning("Não deu para conferir as tabelas de controle: %s", error)
+        return False
+
+    found: dict[str, set[str]] = {}
+    for table_name, column_name in rows:
+        found.setdefault(table_name, set()).add(column_name)
+
+    ok = True
+    for table, columns in CONTROL_COLUMNS.items():
+        missing = sorted(set(columns) - found.get(table, set()))
+        if missing:
+            logger.warning(
+                "%s.%s sem as colunas %s. Tabela criada por uma versão anterior do "
+                "Scheduler: CREATE TABLE IF NOT EXISTS não adiciona coluna — é "
+                "preciso ALTER TABLE à mão.", CONTROL_SCHEMA, table, ", ".join(missing),
+            )
+            ok = False
     return ok

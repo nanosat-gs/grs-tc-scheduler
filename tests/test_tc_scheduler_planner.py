@@ -10,12 +10,18 @@ consulta.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tc_scheduler.planner import PassCandidate, is_worth_tracking, select_passes
+from tc_scheduler.planner import (
+    PassCandidate,
+    is_worth_tracking,
+    mark_telecommand_carriers,
+    plan_passes,
+    select_passes,
+)
 
 T0 = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
 
@@ -162,3 +168,102 @@ def test_chain_of_overlaps_keeps_the_best_and_the_compatible():
 
 def test_empty_input_yields_empty_plan():
     assert select_passes([]) == []
+
+
+# --- Passagens de recepção e decisões do operador ------------------------------
+# Toda passagem é candidata, tenha telecomando ou não: o satélite transmite
+# telemetria sem esperar uplink.
+
+def reception(satellite_id: int, satellite_pass: FakePass, **kwargs) -> PassCandidate:
+    """Candidata sem telecomando na fila: disputa só por elevação."""
+    return replace(candidate(satellite_id, satellite_pass, priority=0, pending=0, **kwargs),
+                   carries_telecommands=False)
+
+
+def test_passagens_sem_telecomando_sao_planejadas():
+    selected = select_passes([reception(1, make_pass(0)), reception(2, make_pass(30))])
+
+    assert [c.satellite_id for c in selected] == [1, 2]
+
+
+def test_telecomando_vence_recepcao_mesmo_mais_baixa():
+    com_comando = candidate(1, make_pass(0, max_elevation_deg=10.0), priority=1, pending=1)
+    so_recepcao = reception(2, make_pass(5, max_elevation_deg=85.0))
+
+    assert [c.satellite_id for c in select_passes([so_recepcao, com_comando])] == [1]
+
+
+def test_entre_passagens_de_recepcao_vence_a_mais_alta():
+    baixa = reception(1, make_pass(0, max_elevation_deg=15.0))
+    alta = reception(2, make_pass(5, max_elevation_deg=60.0))
+
+    assert [c.satellite_id for c in select_passes([baixa, alta])] == [2]
+
+
+def test_forcada_pelo_operador_vence_telecomando():
+    urgente = candidate(1, make_pass(0), priority=10, pending=9)
+    forcada = replace(reception(2, make_pass(5, max_elevation_deg=8.0)), forced=True)
+
+    assert [c.satellite_id for c in select_passes([urgente, forcada])] == [2]
+
+
+def test_pulada_nao_disputa_e_libera_a_vizinha():
+    """Pular uma passagem devolve o rotor a quem perdia para ela."""
+    pulada = replace(reception(1, make_pass(0, max_elevation_deg=80.0)), skipped=True)
+    vizinha = reception(2, make_pass(5, max_elevation_deg=20.0))
+
+    outcomes = {o.candidate.satellite_id: o.outcome for o in plan_passes([pulada, vizinha])}
+
+    assert outcomes == {1: "skipped", 2: "planned"}
+
+
+def test_plan_passes_diz_quem_venceu_o_conflito():
+    vencedora = reception(1, make_pass(0, max_elevation_deg=70.0))
+    perdedora = reception(2, make_pass(5, max_elevation_deg=20.0))
+
+    by_satellite = {o.candidate.satellite_id: o for o in plan_passes([perdedora, vencedora])}
+
+    assert by_satellite[2].outcome == "conflict"
+    assert by_satellite[2].lost_to is vencedora
+    assert by_satellite[1].outcome == "planned"
+
+
+def test_so_a_primeira_passagem_do_satelite_leva_os_telecomandos():
+    """A fila inteira sai na primeira passagem: dar o peso do telecomando às
+    seguintes as faria vencer conflitos em nome de comandos que não vão nelas."""
+    primeira = candidate(1, make_pass(0), priority=9, pending=3)
+    segunda = candidate(1, make_pass(100), priority=9, pending=3)
+
+    marked = mark_telecommand_carriers([segunda, primeira])
+
+    carriers = {c.satellite_pass.aos_time: c.carries_telecommands for c in marked}
+    assert carriers == {primeira.satellite_pass.aos_time: True,
+                        segunda.satellite_pass.aos_time: False}
+
+
+def test_segunda_passagem_do_satelite_disputa_como_recepcao():
+    primeira = candidate(1, make_pass(0), priority=9, pending=3)
+    segunda_do_1 = candidate(1, make_pass(100, max_elevation_deg=10.0), priority=9, pending=3)
+    rival_alta = reception(2, make_pass(105, max_elevation_deg=70.0))
+
+    selected = select_passes(mark_telecommand_carriers([primeira, segunda_do_1]) + [rival_alta])
+
+    assert [(c.satellite_id, c.satellite_pass.aos_time) for c in selected] == [
+        (1, primeira.satellite_pass.aos_time), (2, rival_alta.satellite_pass.aos_time),
+    ]
+
+
+def test_pular_a_primeira_passa_os_telecomandos_para_a_seguinte():
+    primeira = replace(candidate(1, make_pass(0), priority=9, pending=3), skipped=True)
+    segunda = candidate(1, make_pass(100), priority=9, pending=3)
+
+    marked = {c.satellite_pass.aos_time: c for c in mark_telecommand_carriers([primeira, segunda])}
+
+    assert marked[segunda.satellite_pass.aos_time].carries_telecommands is True
+    assert marked[primeira.satellite_pass.aos_time].carries_telecommands is False
+
+
+def test_satelite_sem_fila_nao_tem_portadora_de_telecomando():
+    marked = mark_telecommand_carriers([candidate(1, make_pass(0), priority=0, pending=0)])
+
+    assert marked[0].carries_telecommands is False

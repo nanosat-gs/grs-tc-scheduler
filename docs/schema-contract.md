@@ -92,3 +92,21 @@ com evidência será distinguível destes pela mensagem.
 
 Passagem `missed` **devolve** os comandos à fila: ali a antena nem chegou a
 apontar.
+
+## As tabelas que são deste serviço: `mission_control`
+
+O controle do operador sobre passagens precisava de tabelas, e o schema acima
+não é nosso. Em vez de mexer no fork do TC Generator (que não tem mecanismo de
+migração), o Scheduler cria as suas num schema separado, `mission_control`, no
+boot (`db.ensure_control_schema`, `CREATE ... IF NOT EXISTS`). É o mesmo
+arranjo do `grs-iq-recorder`.
+
+| Tabela | Colunas | Uso |
+|---|---|---|
+| `satellite_reception` | `satellite_id` (PK, FK `satellites` ON DELETE CASCADE), `track_passes`, `downlink_frequency_hz`, `updated_at` | Rastrear passagens para recepção e a portadora de downlink. Sem linha = padrão (rastrear, sem frequência) |
+| `pass_decisions` | `id`, `satellite_id`, `predicted_aos`, `decision` (`skip`/`force`), `created_at` | Decisão do operador sobre uma passagem, casada por satélite + AOS ±10 min. Podada 6 h depois |
+| `pass_predictions` | `satellite_id`, `aos_time`, `los_time`, `culmination_time`, `max_elevation_deg`, `outcome`, `lost_to_satellite_id`, `lost_to_aos_time`, `forced`, `carries_telecommands`, `telecommand_count`, `computed_at` | Todas as candidatas do último replanejamento e o resultado de cada uma. Substituída inteira na mesma transação que grava as `planned` |
+
+`schema_check.py` também confere estas colunas. Divergência aqui só acontece
+com uma versão nova do Scheduler subindo contra tabelas criadas por uma antiga,
+e se resolve com `ALTER TABLE`.
