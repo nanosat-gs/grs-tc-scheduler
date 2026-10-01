@@ -139,7 +139,13 @@ class FakeControl:
             raise NotFound(f"satélite {code} não encontrado")
         if changes == {"track_passes": "sim"}:
             raise ControlError("track_passes precisa ser true ou false")
-        return {"code": code, "track_passes": True, "downlink_frequency_hz": None}
+        return {"code": code, "track_passes": True, "downlinks": []}
+
+    def set_downlinks(self, code, downlinks):
+        self.calls.append(("downlinks", code, downlinks))
+        if downlinks == "ruim":
+            raise ControlError("downlinks precisa ser uma lista")
+        return {"code": code, "track_passes": True, "downlinks": downlinks}
 
     def set_decision(self, code, aos, decision):
         self.calls.append(("decision", code, aos, decision))
@@ -181,12 +187,11 @@ def test_recepcao_repassa_os_campos(control_client):
     control = FakeControl()
     response = control_client(control).put(
         "/api/satellites/SAT-1/reception",
-        json={"track_passes": False, "downlink_frequency_hz": 145_900_000},
+        json={"track_passes": False},
     )
 
     assert response.status_code == 200
-    assert control.calls == [("reception", "SAT-1",
-                              {"track_passes": False, "downlink_frequency_hz": 145_900_000})]
+    assert control.calls == [("reception", "SAT-1", {"track_passes": False})]
 
 
 def test_recepcao_invalida_e_400_com_a_mensagem(control_client):
@@ -226,3 +231,32 @@ def test_decisao_sem_os_campos_e_400(control_client, body):
     response = control_client(FakeControl()).put("/api/passes/decision", json=body)
 
     assert response.status_code == 400
+
+
+def test_downlinks_repassa_a_lista(control_client):
+    control = FakeControl()
+    lista = [{"name": "beacon", "frequency_hz": 145_900_000}]
+
+    response = control_client(control).put("/api/satellites/SAT-1/downlinks",
+                                           json={"downlinks": lista})
+
+    assert response.status_code == 200
+    assert control.calls == [("downlinks", "SAT-1", lista)]
+
+
+@pytest.mark.parametrize("body", [None, [], {"lista": []}])
+def test_downlinks_sem_a_chave_e_400(control_client, body):
+    control = FakeControl()
+
+    response = control_client(control).put("/api/satellites/SAT-1/downlinks", json=body)
+
+    assert response.status_code == 400
+    assert control.calls == []
+
+
+def test_downlinks_invalidos_viram_400_com_a_mensagem(control_client):
+    response = control_client(FakeControl()).put("/api/satellites/SAT-1/downlinks",
+                                                 json={"downlinks": "ruim"})
+
+    assert response.status_code == 400
+    assert "lista" in response.get_json()["error"]

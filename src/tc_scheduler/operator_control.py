@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from tc_scheduler.db import CONTROL_SCHEMA, PASS_MATCH_TOLERANCE
+from tc_scheduler.radios import Radio, annotate
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,10 @@ DECISIONS = ("skip", "force")
 # erro de unidade — MHz digitado onde se esperava Hz, quase sempre.
 MIN_FREQUENCY_HZ = 1e6
 MAX_FREQUENCY_HZ = 6e9
+
+# Um satélite com mais portadoras que isto é quase certamente cadastro errado.
+MAX_DOWNLINKS = 8
+MAX_DOWNLINK_NAME = 40
 
 
 class ControlError(ValueError):
@@ -59,17 +64,24 @@ _PREDICTIONS_SQL = f"""
 
 _RECEPTION_SQL = f"""
     SELECT s.code, s.name, s.status,
-           COALESCE(r.track_passes, TRUE) AS track_passes,
-           r.downlink_frequency_hz
+           COALESCE(r.track_passes, TRUE) AS track_passes
     FROM satellites s
     LEFT JOIN {CONTROL_SCHEMA}.satellite_reception r ON r.satellite_id = s.id
     ORDER BY s.name
 """
 
+_DOWNLINKS_SQL = f"""
+    SELECT s.code, d.name, d.frequency_hz, d.enabled
+    FROM {CONTROL_SCHEMA}.satellite_downlinks d
+    JOIN satellites s ON s.id = d.satellite_id
+    ORDER BY s.code, d.position, d.id
+"""
+
 
 class OperatorControl:
-    def __init__(self, engine) -> None:
+    def __init__(self, engine, radios: Optional[list[Radio]] = None) -> None:
         self._engine = engine
+        self._radios = list(radios or [])
 
     # --- Leitura --------------------------------------------------------------
 
@@ -83,16 +95,23 @@ class OperatorControl:
                 {"tolerance": PASS_MATCH_TOLERANCE.total_seconds()},
             ).mappings()]
             reception = [dict(r) for r in conn.execute(text(_RECEPTION_SQL)).mappings()]
+            downlinks: dict[str, list[dict]] = {}
+            for row in conn.execute(text(_DOWNLINKS_SQL)).mappings():
+                downlinks.setdefault(row["code"], []).append({
+                    "name": row["name"], "frequency_hz": row["frequency_hz"],
+                    "enabled": bool(row["enabled"]),
+                })
 
         computed_at = max((p["computed_at"] for p in passes), default=None)
         return {
             "computed_at": _iso(computed_at),
             "passes": [_prediction_to_dict(p) for p in passes],
+            "radios": [radio.to_dict() for radio in self._radios],
             "reception": [
                 {
                     "code": r["code"], "name": r["name"], "status": r["status"],
                     "track_passes": bool(r["track_passes"]),
-                    "downlink_frequency_hz": r["downlink_frequency_hz"],
+                    "downlinks": annotate(downlinks.get(r["code"], []), self._radios),
                 }
                 for r in reception
             ],
@@ -101,56 +120,63 @@ class OperatorControl:
     # --- Escrita --------------------------------------------------------------
 
     def set_reception(self, code: str, changes: dict[str, Any]) -> dict[str, Any]:
-        """Liga/desliga o rastreio de passagens e cadastra a frequência de downlink.
-
-        Parcial: só os campos enviados mudam.
-        """
+        """Liga/desliga o rastreio de passagens para recepção."""
         from sqlalchemy import text
 
         if not isinstance(changes, dict) or not changes:
-            raise ControlError("envie track_passes e/ou downlink_frequency_hz")
-        unknown = set(changes) - {"track_passes", "downlink_frequency_hz"}
+            raise ControlError("envie track_passes")
+        if "downlink_frequency_hz" in changes:
+            raise ControlError("a frequência agora é por downlink: "
+                               f"PUT /api/satellites/{code}/downlinks")
+        unknown = set(changes) - {"track_passes"}
         if unknown:
             raise ControlError(f"campo desconhecido: {', '.join(sorted(unknown))}")
 
         track = changes.get("track_passes")
-        if "track_passes" in changes and not isinstance(track, bool):
+        if not isinstance(track, bool):
             raise ControlError("track_passes precisa ser true ou false")
-
-        frequency = changes.get("downlink_frequency_hz")
-        if "downlink_frequency_hz" in changes and frequency is not None:
-            if isinstance(frequency, bool) or not isinstance(frequency, (int, float)) \
-                    or not math.isfinite(frequency):
-                raise ControlError("downlink_frequency_hz precisa ser um número, em Hz")
-            if not MIN_FREQUENCY_HZ <= frequency <= MAX_FREQUENCY_HZ:
-                raise ControlError(
-                    f"downlink_frequency_hz fora de 1 MHz a 6 GHz: {frequency:g} Hz "
-                    "(a frequência vai em Hz, não em MHz)"
-                )
 
         with self._engine.begin() as conn:
             satellite_id = self._satellite_id(conn, code)
             conn.execute(text(f"""
                 INSERT INTO {CONTROL_SCHEMA}.satellite_reception
-                    (satellite_id, track_passes, downlink_frequency_hz, updated_at)
-                VALUES (:satellite_id, COALESCE(:track, TRUE), :frequency, now())
+                    (satellite_id, track_passes, updated_at)
+                VALUES (:satellite_id, :track, now())
                 ON CONFLICT (satellite_id) DO UPDATE SET
-                    track_passes = CASE WHEN :set_track
-                                        THEN EXCLUDED.track_passes
-                                        ELSE {CONTROL_SCHEMA}.satellite_reception.track_passes END,
-                    downlink_frequency_hz = CASE WHEN :set_frequency
-                                        THEN EXCLUDED.downlink_frequency_hz
-                                        ELSE {CONTROL_SCHEMA}.satellite_reception.downlink_frequency_hz END,
+                    track_passes = EXCLUDED.track_passes,
                     updated_at = now()
-            """), {
-                "satellite_id": satellite_id,
-                "track": track,
-                "frequency": float(frequency) if frequency is not None else None,
-                "set_track": "track_passes" in changes,
-                "set_frequency": "downlink_frequency_hz" in changes,
-            })
+            """), {"satellite_id": satellite_id, "track": track})
 
         logger.info("Recepção de %s alterada pelo operador: %s", code, changes)
+        return self._reception_of(code)
+
+    def set_downlinks(self, code: str, downlinks: Any) -> dict[str, Any]:
+        """Substitui a lista de downlinks do satélite, inteira, numa transação.
+
+        A lista inteira, e não um item por vez: a ORDEM importa (o primeiro
+        ligado é a referência do Doppler, e numa faixa com dois fica o
+        primeiro), e uma edição parcial deixaria a ordem a cargo de quem
+        chegou por último.
+        """
+        from sqlalchemy import text
+
+        cleaned = _validate_downlinks(downlinks)
+
+        with self._engine.begin() as conn:
+            satellite_id = self._satellite_id(conn, code)
+            conn.execute(text(f"""
+                DELETE FROM {CONTROL_SCHEMA}.satellite_downlinks WHERE satellite_id = :id
+            """), {"id": satellite_id})
+            for position, downlink in enumerate(cleaned):
+                conn.execute(text(f"""
+                    INSERT INTO {CONTROL_SCHEMA}.satellite_downlinks
+                        (satellite_id, name, frequency_hz, enabled, position)
+                    VALUES (:satellite_id, :name, :frequency_hz, :enabled, :position)
+                """), {"satellite_id": satellite_id, "position": position, **downlink})
+
+        logger.info("Downlinks de %s alterados pelo operador: %s", code,
+                    ", ".join(f"{d['name']} {d['frequency_hz'] / 1e6:.4f} MHz" for d in cleaned)
+                    or "nenhum")
         return self._reception_of(code)
 
     def set_decision(self, code: str, aos_iso: str, decision: Optional[str]) -> None:
@@ -232,3 +258,46 @@ def _prediction_to_dict(row: dict[str, Any]) -> dict[str, Any]:
 
 def _iso(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() if value is not None else None
+
+
+def _validate_downlinks(downlinks: Any) -> list[dict[str, Any]]:
+    if not isinstance(downlinks, list):
+        raise ControlError("downlinks precisa ser uma lista")
+    if len(downlinks) > MAX_DOWNLINKS:
+        raise ControlError(f"no máximo {MAX_DOWNLINKS} downlinks por satélite")
+
+    cleaned: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(downlinks, start=1):
+        if not isinstance(item, dict):
+            raise ControlError(f"downlink {index}: esperava um objeto")
+        unknown = set(item) - {"name", "frequency_hz", "enabled"}
+        if unknown:
+            raise ControlError(f"downlink {index}: campo desconhecido {', '.join(sorted(unknown))}")
+
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ControlError(f"downlink {index}: dê um nome (ex.: beacon, dados)")
+        name = name.strip()
+        if len(name) > MAX_DOWNLINK_NAME:
+            raise ControlError(f"downlink {index}: nome com mais de {MAX_DOWNLINK_NAME} caracteres")
+        if name.lower() in seen:
+            raise ControlError(f"downlink {name} repetido")
+        seen.add(name.lower())
+
+        frequency = item.get("frequency_hz")
+        if isinstance(frequency, bool) or not isinstance(frequency, (int, float)) \
+                or not math.isfinite(frequency):
+            raise ControlError(f"{name}: frequency_hz precisa ser um número, em Hz")
+        if not MIN_FREQUENCY_HZ <= frequency <= MAX_FREQUENCY_HZ:
+            raise ControlError(
+                f"{name}: frequency_hz fora de 1 MHz a 6 GHz: {frequency:g} Hz "
+                "(a frequência vai em Hz, não em MHz)"
+            )
+
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ControlError(f"{name}: enabled precisa ser true ou false")
+
+        cleaned.append({"name": name, "frequency_hz": float(frequency), "enabled": enabled})
+    return cleaned

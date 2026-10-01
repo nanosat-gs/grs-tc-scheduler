@@ -24,9 +24,9 @@ inteira; as seguintes disputam como recepção (`mark_telecommand_carriers`).
 
 Manda **uma ordem por passagem** (`track_satellite`) ao Station Manager, não um
 setpoint por segundo: planejar é lento e apontar é rápido, e separá-los faz com
-que um replanejamento nunca atrase o rotor. Com frequência de downlink
-cadastrada, a ordem a leva junto, e o Station Manager anuncia portadora e
-Doppler ao caminho de recepção.
+que um replanejamento nunca atrase o rotor. A ordem leva os downlinks ligados
+do satélite, em ordem (`[{name, frequency_hz}]`), e o Station Manager anuncia
+portadora e Doppler de cada um ao rádio da sua faixa.
 
 ## Controle do operador sobre passagens
 
@@ -36,7 +36,8 @@ que é deste serviço (criado no boot por `db.ensure_control_schema`):
 
 | Tabela | O quê |
 |---|---|
-| `satellite_reception` | Por satélite: `track_passes` (padrão ligado; sem linha = padrão) e `downlink_frequency_hz` |
+| `satellite_reception` | Por satélite: `track_passes` (padrão ligado; sem linha = padrão). A coluna `downlink_frequency_hz` é obsoleta: migrada no boot para `satellite_downlinks` e zerada |
+| `satellite_downlinks` | As portadoras do satélite: nome, frequência, ligado, ordem. `PUT /api/satellites/<code>/downlinks` substitui a lista inteira (a ordem importa: o primeiro ligado é a referência do Doppler) |
 | `pass_decisions` | `skip` ou `force` numa passagem. Desfazer = apagar a linha |
 | `pass_predictions` | Resultado do último replanejamento, **todas** as candidatas: `planned`, `conflict` (com quem venceu), `skipped`, `reception_off`. É como a API mostra as que perderam sem compartilhar memória com o laço |
 
@@ -76,6 +77,11 @@ incomodar, `api.py` **já é executável sozinho** (`python -m tc_scheduler.api`
 a saída é um serviço a mais no compose, mesma imagem, sem tocar em código.
 
 ## Armadilhas
+
+- **`STATION_RADIOS` aqui só informa o painel.** Quem roteia downlink para
+  rádio é o Station Manager, com a mesma variável. A regra de `radios.annotate`
+  tem de continuar igual à de `mgm8.domain.models.route_downlinks`, ou o
+  painel promete um rádio e a estação usa outro.
 
 - **Satélite sem passagem no plano: confira a recepção.** Todo satélite
   `active` com dado orbital entra (`fetch_candidate_satellites`), a menos que o

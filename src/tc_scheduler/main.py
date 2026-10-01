@@ -347,7 +347,7 @@ class Scheduler:
                 orbital_data.to_json(),
                 until_iso=scheduled_pass["los_time"].isoformat(),
                 satellite_name=name,
-                downlink_frequency_hz=scheduled_pass.get("downlink_frequency_hz"),
+                downlinks=scheduled_pass.get("downlinks") or None,
             )
         except (StationManagerUnavailable, StationManagerError) as error:
             # Não marca 'missed' aqui: a janela ainda está aberta, e o próximo
@@ -477,6 +477,7 @@ def _start_api():
     """
     from tc_scheduler import api, station_data as station_data_module
     from tc_scheduler.operator_control import OperatorControl
+    from tc_scheduler.radios import parse_radios
 
     try:
         data = station_data_module.from_environment()
@@ -484,7 +485,8 @@ def _start_api():
             return None
         # Engine próprio também para o controle do operador: a leitura do
         # painel e as ações dele não disputam o mesmo pool de duas conexões.
-        control = OperatorControl(db.build_engine(config.DATABASE_URL))
+        control = OperatorControl(db.build_engine(config.DATABASE_URL),
+                                  radios=parse_radios(config.STATION_RADIOS))
         thread = threading.Thread(
             target=api.create_app(data, control).run,
             # threaded=True: sem isso, uma consulta lenta ao banco travaria

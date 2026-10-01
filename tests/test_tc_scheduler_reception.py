@@ -114,9 +114,10 @@ class FakeStation:
         self.tracked = []
 
     def track_satellite(self, orbital_data, until_iso, satellite_name=None,
-                        downlink_frequency_hz=None):
+                        downlink_frequency_hz=None, downlinks=None):
         self.tracked.append({"name": satellite_name, "until": until_iso,
-                             "downlink_frequency_hz": downlink_frequency_hz})
+                             "downlink_frequency_hz": downlink_frequency_hz,
+                             "downlinks": downlinks})
         return {}
 
     def get_tracking(self):
@@ -303,17 +304,16 @@ def test_acao_do_operador_dispara_replanejamento(engine):
     assert not has_pass_near(planned(engine), first["aos_time"])
 
 
-# --- Recepção e frequência --------------------------------------------------------
+# --- Recepção e downlinks -------------------------------------------------------
 
-def test_frequencia_vai_no_track_satellite(engine):
+BEACON = {"name": "beacon", "frequency_hz": 145_900_000}
+DATA = {"name": "dados", "frequency_hz": 468_400_000}
+RADIOS = "vhf=143000000-148000000,uhf=462000000-470000000"
+
+
+def bring_first_pass_to_now(engine):
     from sqlalchemy import text
 
-    add_satellite(engine, "RX-1", 90001)
-    control(engine).set_reception("RX-1", {"downlink_frequency_hz": 145_900_000})
-    scheduler = scheduler_for(engine)
-    scheduler.replan()
-
-    # Traz a primeira passagem para "agora", para o drive_passes assumi-la.
     first = planned(engine)[0]
     now = datetime.now(timezone.utc)
     with engine.begin() as conn:
@@ -322,15 +322,72 @@ def test_frequencia_vai_no_track_satellite(engine):
         """), {"aos": now - timedelta(minutes=1), "los": now + timedelta(minutes=9),
                "id": first["id"]})
 
+
+def test_downlinks_ligados_vao_no_track_satellite_em_ordem(engine):
+    add_satellite(engine, "RX-1", 90001)
+    control(engine).set_downlinks("RX-1", [
+        BEACON, DATA, {"name": "uhf-amador", "frequency_hz": 436_100_000, "enabled": False},
+    ])
+    scheduler = scheduler_for(engine)
+    scheduler.replan()
+    bring_first_pass_to_now(engine)
+
     scheduler.drive_passes()
 
-    assert scheduler._station.tracked[0]["downlink_frequency_hz"] == 145_900_000
+    assert scheduler._station.tracked[0]["downlinks"] == [
+        {"name": "beacon", "frequency_hz": 145_900_000.0},
+        {"name": "dados", "frequency_hz": 468_400_000.0},
+    ]
+
+
+def test_sem_downlinks_rastreia_sem_sintonia(engine):
+    add_satellite(engine, "RX-1", 90001)
+    scheduler = scheduler_for(engine)
+    scheduler.replan()
+    bring_first_pass_to_now(engine)
+
+    scheduler.drive_passes()
+
+    assert scheduler._station.tracked[0]["downlinks"] is None
+
+
+def test_lista_de_downlinks_e_substituida_inteira(engine):
+    add_satellite(engine, "RX-1", 90001)
+    ctl = control(engine)
+    ctl.set_downlinks("RX-1", [BEACON, DATA])
+
+    result = ctl.set_downlinks("RX-1", [DATA])
+
+    assert [d["name"] for d in result["downlinks"]] == ["dados"]
+
+
+@pytest.mark.parametrize("downlinks, message", [
+    ("beacon", "lista"),
+    ([{"name": "beacon", "frequency_hz": 145.9}], "Hz, não em MHz"),
+    ([{"name": "beacon", "frequency_hz": "145900000"}], "número"),
+    ([{"name": "", "frequency_hz": 145_900_000}], "nome"),
+    ([BEACON, {"name": "Beacon", "frequency_hz": 145_800_000}], "repetido"),
+    ([{**BEACON, "canal": 1}], "desconhecido"),
+    ([{**BEACON, "enabled": "sim"}], "true ou false"),
+    ([{"name": f"d{i}", "frequency_hz": 145_900_000} for i in range(9)], "no máximo"),
+])
+def test_downlinks_invalidos_sao_recusados_sem_mexer_no_cadastro(engine, downlinks, message):
+    from tc_scheduler.operator_control import ControlError
+
+    add_satellite(engine, "RX-1", 90001)
+    ctl = control(engine)
+    ctl.set_downlinks("RX-1", [BEACON])
+
+    with pytest.raises(ControlError, match=message):
+        ctl.set_downlinks("RX-1", downlinks)
+
+    reception = next(r for r in ctl.predictions()["reception"] if r["code"] == "RX-1")
+    assert [d["name"] for d in reception["downlinks"]] == ["beacon"]
 
 
 @pytest.mark.parametrize("changes, message", [
     ({"track_passes": "sim"}, "true ou false"),
-    ({"downlink_frequency_hz": 145.9}, "Hz, não em MHz"),
-    ({"downlink_frequency_hz": "145900000"}, "número"),
+    ({"downlink_frequency_hz": 145_900_000}, "por downlink"),
     ({"canal": 1}, "desconhecido"),
     ({}, "envie"),
 ])
@@ -342,15 +399,65 @@ def test_recepcao_invalida_e_recusada(engine, changes, message):
         control(engine).set_reception("RX-1", changes)
 
 
-def test_recepcao_parcial_preserva_o_outro_campo(engine):
+def test_recepcao_nao_mexe_nos_downlinks(engine):
     add_satellite(engine, "RX-1", 90001)
     ctl = control(engine)
+    ctl.set_downlinks("RX-1", [BEACON])
 
-    ctl.set_reception("RX-1", {"downlink_frequency_hz": 145_900_000})
     result = ctl.set_reception("RX-1", {"track_passes": False})
 
-    assert result["downlink_frequency_hz"] == 145_900_000
     assert result["track_passes"] is False
+    assert [d["name"] for d in result["downlinks"]] == ["beacon"]
+
+
+def test_frequencia_unica_antiga_vira_o_downlink_principal(engine):
+    """Migração: o banco de quem já usava a frequência única não perde o
+    cadastro, e o "principal" não renasce depois de apagado."""
+    from sqlalchemy import text
+
+    from tc_scheduler import db
+
+    satellite_id = add_satellite(engine, "RX-1", 90001)
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            INSERT INTO {db.CONTROL_SCHEMA}.satellite_reception (satellite_id, downlink_frequency_hz)
+            VALUES (:id, 145900000)
+        """), {"id": satellite_id})
+
+    db.ensure_control_schema(engine)
+    db.ensure_control_schema(engine)  # idempotente
+
+    ctl = control(engine)
+    reception = next(r for r in ctl.predictions()["reception"] if r["code"] == "RX-1")
+    assert [(d["name"], d["frequency_hz"]) for d in reception["downlinks"]] == [
+        ("principal", 145_900_000.0)]
+
+    ctl.set_downlinks("RX-1", [])
+    db.ensure_control_schema(engine)
+    reception = next(r for r in ctl.predictions()["reception"] if r["code"] == "RX-1")
+    assert reception["downlinks"] == []
+
+
+def test_painel_sabe_que_radio_ouve_cada_downlink(engine):
+    from tc_scheduler.operator_control import OperatorControl
+    from tc_scheduler.radios import parse_radios
+
+    add_satellite(engine, "RX-1", 90001)
+    ctl = OperatorControl(engine, radios=parse_radios(RADIOS))
+    ctl.set_downlinks("RX-1", [
+        BEACON, DATA,
+        {"name": "uhf-amador", "frequency_hz": 436_100_000},
+        {"name": "beacon-2", "frequency_hz": 145_800_000},
+    ])
+
+    result = ctl.predictions()
+    downlinks = {d["name"]: d for d in
+                 next(r for r in result["reception"] if r["code"] == "RX-1")["downlinks"]}
+
+    assert [r["name"] for r in result["radios"]] == ["vhf", "uhf"]
+    assert (downlinks["beacon"]["radio"], downlinks["dados"]["radio"]) == ("vhf", "uhf")
+    assert "nenhum rádio" in downlinks["uhf-amador"]["issue"]
+    assert "já ouve beacon" in downlinks["beacon-2"]["issue"]
 
 
 def test_satelite_inexistente(engine):

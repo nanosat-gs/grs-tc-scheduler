@@ -37,7 +37,6 @@ class CandidateSatellite:
     pending_telecommands: int
     max_priority: int
     track_passes: bool
-    downlink_frequency_hz: Optional[float]
 
     @property
     def has_manual_tle(self) -> bool:
@@ -66,9 +65,28 @@ _CONTROL_DDL = (
         satellite_id          INTEGER PRIMARY KEY REFERENCES satellites(id) ON DELETE CASCADE,
         -- Sem linha para o satélite vale o padrão: rastrear toda passagem.
         track_passes          BOOLEAN NOT NULL DEFAULT TRUE,
+        -- OBSOLETA: a frequência agora é por downlink (satellite_downlinks).
+        -- Mantida para não quebrar uma versão anterior do Scheduler subindo
+        -- contra este banco; ensure_control_schema migra e zera o valor.
         downlink_frequency_hz DOUBLE PRECISION
             CHECK (downlink_frequency_hz IS NULL OR downlink_frequency_hz > 0),
         updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.satellite_downlinks (
+        id            BIGSERIAL PRIMARY KEY,
+        satellite_id  INTEGER NOT NULL REFERENCES satellites(id) ON DELETE CASCADE,
+        -- "beacon", "dados"... É o que o operador vê e o que o Station
+        -- Manager loga ao rotear cada portadora para um rádio.
+        name          TEXT NOT NULL,
+        frequency_hz  DOUBLE PRECISION NOT NULL CHECK (frequency_hz > 0),
+        enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+        -- Ordem do cadastro: o primeiro downlink ligado é a referência do
+        -- Doppler, e numa faixa com dois downlinks fica o primeiro.
+        position      INTEGER NOT NULL DEFAULT 0,
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (satellite_id, name)
     )
     """,
     f"""
@@ -107,6 +125,9 @@ CONTROL_COLUMNS: dict[str, tuple[str, ...]] = {
     "satellite_reception": (
         "satellite_id", "track_passes", "downlink_frequency_hz", "updated_at",
     ),
+    "satellite_downlinks": (
+        "id", "satellite_id", "name", "frequency_hz", "enabled", "position", "updated_at",
+    ),
     "pass_decisions": ("id", "satellite_id", "predicted_aos", "decision", "created_at"),
     "pass_predictions": (
         "satellite_id", "aos_time", "los_time", "culmination_time", "max_elevation_deg",
@@ -121,7 +142,33 @@ def ensure_control_schema(engine: Engine) -> None:
     with engine.begin() as conn:
         for statement in _CONTROL_DDL:
             conn.execute(text(statement))
+        migrated = _migrate_single_frequency(conn)
+    if migrated:
+        logger.info("%d frequência(s) de downlink migradas para satellite_downlinks.", migrated)
     logger.info("Tabelas de controle de passagens prontas em %s.", CONTROL_SCHEMA)
+
+
+def _migrate_single_frequency(conn: Connection) -> int:
+    """A frequência única de `satellite_reception` vira o downlink "principal".
+
+    Só para satélite que ainda não tem downlink nenhum, e o valor antigo é
+    zerado na mesma transação: sem isso, um operador que apagasse todos os
+    downlinks veria o "principal" renascer no próximo boot.
+    """
+    migrated = conn.execute(text(f"""
+        INSERT INTO {CONTROL_SCHEMA}.satellite_downlinks (satellite_id, name, frequency_hz, position)
+        SELECT r.satellite_id, 'principal', r.downlink_frequency_hz, 0
+        FROM {CONTROL_SCHEMA}.satellite_reception r
+        WHERE r.downlink_frequency_hz IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM {CONTROL_SCHEMA}.satellite_downlinks d
+                          WHERE d.satellite_id = r.satellite_id)
+    """)).rowcount
+    conn.execute(text(f"""
+        UPDATE {CONTROL_SCHEMA}.satellite_reception
+        SET downlink_frequency_hz = NULL
+        WHERE downlink_frequency_hz IS NOT NULL
+    """))
+    return migrated
 
 
 def build_engine(database_url: str) -> Engine:
@@ -165,8 +212,7 @@ def fetch_candidate_satellites(conn: Connection) -> list[CandidateSatellite]:
         SELECT s.id, s.name, s.code, s.norad_id, s.tle_line1, s.tle_line2,
                COALESCE(tc.pending, 0) AS pending_telecommands,
                COALESCE(tc.max_priority, 0) AS max_priority,
-               COALESCE(r.track_passes, TRUE) AS track_passes,
-               r.downlink_frequency_hz
+               COALESCE(r.track_passes, TRUE) AS track_passes
         FROM satellites s
         LEFT JOIN (
             SELECT t.satellite_id, COUNT(*) AS pending, MAX(t.priority) AS max_priority
@@ -297,8 +343,8 @@ def fetch_station_overview(conn: Connection) -> dict[str, Any]:
 def fetch_pass_to_activate(conn: Connection, now: datetime) -> Optional[dict[str, Any]]:
     """Passagem planejada cuja janela já começou e ainda não terminou.
 
-    Traz a frequência de downlink do satélite, quando cadastrada: ela vai no
-    `track_satellite` para o Station Manager anunciar a sintonia.
+    Traz os downlinks ligados do satélite, em ordem: vão no `track_satellite`
+    para o Station Manager anunciar a sintonia de cada rádio.
 
     `name` além de `satellite_name`: `load_orbital_data` lê `name` para montar
     os dados de um TLE manual. Sem ele, todo satélite de TLE manual falhava
@@ -307,10 +353,13 @@ def fetch_pass_to_activate(conn: Connection, now: datetime) -> Optional[dict[str
     row = conn.execute(text(f"""
         SELECT p.id, p.satellite_id, p.aos_time, p.los_time, p.max_elevation_deg,
                s.name, s.name AS satellite_name, s.norad_id, s.tle_line1, s.tle_line2,
-               r.downlink_frequency_hz
+               (SELECT COALESCE(json_agg(json_build_object('name', d.name,
+                                                          'frequency_hz', d.frequency_hz)
+                                        ORDER BY d.position, d.id), '[]'::json)
+                FROM {CONTROL_SCHEMA}.satellite_downlinks d
+                WHERE d.satellite_id = s.id AND d.enabled) AS downlinks
         FROM scheduled_passes p
         JOIN satellites s ON s.id = p.satellite_id
-        LEFT JOIN {CONTROL_SCHEMA}.satellite_reception r ON r.satellite_id = s.id
         WHERE p.status = 'planned'
           AND p.aos_time <= :now
           AND p.los_time > :now
@@ -324,10 +373,13 @@ def fetch_active_pass(conn: Connection) -> Optional[dict[str, Any]]:
     row = conn.execute(text(f"""
         SELECT p.id, p.satellite_id, p.aos_time, p.los_time,
                s.name, s.name AS satellite_name, s.norad_id, s.tle_line1, s.tle_line2,
-               r.downlink_frequency_hz
+               (SELECT COALESCE(json_agg(json_build_object('name', d.name,
+                                                          'frequency_hz', d.frequency_hz)
+                                        ORDER BY d.position, d.id), '[]'::json)
+                FROM {CONTROL_SCHEMA}.satellite_downlinks d
+                WHERE d.satellite_id = s.id AND d.enabled) AS downlinks
         FROM scheduled_passes p
         JOIN satellites s ON s.id = p.satellite_id
-        LEFT JOIN {CONTROL_SCHEMA}.satellite_reception r ON r.satellite_id = s.id
         WHERE p.status = 'active'
         ORDER BY p.aos_time
         LIMIT 1

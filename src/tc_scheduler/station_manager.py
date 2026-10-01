@@ -72,12 +72,14 @@ class StationManagerClient:
 
     def track_satellite(self, orbital_data: dict, until_iso: str,
                         satellite_name: Optional[str] = None,
-                        downlink_frequency_hz: Optional[float] = None) -> dict[str, Any]:
+                        downlink_frequency_hz: Optional[float] = None,
+                        downlinks: Optional[list[dict]] = None) -> dict[str, Any]:
         """Entrega a passagem inteira ao Station Manager, numa ordem só.
 
-        Com `downlink_frequency_hz`, o Station Manager anuncia a portadora e o
-        Doppler do satélite para o caminho de recepção. Sem ela, rastreia igual,
-        só sem anúncio de sintonia.
+        Com `downlinks` ([{name, frequency_hz}], em ordem), o Station Manager
+        anuncia a portadora e o Doppler de cada um no canal do rádio que o
+        cobre. `downlink_frequency_hz` é a forma antiga, de uma portadora só.
+        Sem nenhum dos dois, rastreia igual, só sem anúncio de sintonia.
         """
         message = {
             "cmd": "track_satellite",
@@ -87,6 +89,8 @@ class StationManagerClient:
         }
         if downlink_frequency_hz is not None:
             message["downlink_frequency_hz"] = downlink_frequency_hz
+        if downlinks:
+            message["downlinks"] = downlinks
         reply = self._request(message)
         return reply["tracking"]
 

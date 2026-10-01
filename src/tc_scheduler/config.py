@@ -62,3 +62,8 @@ API_ENABLED = os.getenv("SCHEDULER_API_ENABLED", "1").lower() not in ("0", "fals
 # --- Estação terrestre ------------------------------------------------------
 GROUND_STATION = tracking_config.GROUND_STATION
 MIN_ELEVATION_DEG = tracking_config.MIN_ELEVATION_DEG
+
+# Rádios da estação e a faixa de cada um (nome=min-max em Hz, separados por
+# vírgula). O mesmo valor vai ao Station Manager, que é quem roteia; aqui só
+# serve para o painel dizer que rádio ouve cada downlink cadastrado.
+STATION_RADIOS = os.getenv("STATION_RADIOS", "")

@@ -68,9 +68,21 @@ def create_app(station_data: Any, control: Any = None) -> Flask:
 
     @app.put("/api/satellites/<code>/reception")
     def reception(code: str):
-        """Liga/desliga o rastreio de passagens e cadastra a frequência de downlink."""
+        """Liga/desliga o rastreio de passagens para recepção."""
         body = request.get_json(silent=True)
         return control_call(lambda: control.set_reception(code, body))
+
+    @app.put("/api/satellites/<code>/downlinks")
+    def downlinks(code: str):
+        """Substitui a lista de downlinks: {"downlinks": [{name, frequency_hz, enabled}]}."""
+        body = request.get_json(silent=True)
+
+        def act():
+            if not isinstance(body, dict) or "downlinks" not in body:
+                raise ControlError('envie {"downlinks": [...]}')
+            return control.set_downlinks(code, body["downlinks"])
+
+        return control_call(act)
 
     @app.put("/api/passes/decision")
     def decision():
@@ -141,6 +153,7 @@ def main() -> None:
 
     from tc_scheduler import config, db, station_data as station_data_module
     from tc_scheduler.operator_control import OperatorControl
+    from tc_scheduler.radios import parse_radios
 
     _logging.basicConfig(
         level=_logging.INFO,
@@ -153,7 +166,7 @@ def main() -> None:
 
     engine = db.build_engine(config.DATABASE_URL)
     db.ensure_control_schema(engine)
-    control = OperatorControl(engine)
+    control = OperatorControl(engine, radios=parse_radios(config.STATION_RADIOS))
 
     logger.info("API em http://%s:%d", config.API_HOST, config.API_PORT)
     try:
