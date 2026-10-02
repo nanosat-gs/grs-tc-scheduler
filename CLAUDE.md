@@ -37,7 +37,7 @@ que é deste serviço (criado no boot por `db.ensure_control_schema`):
 | Tabela | O quê |
 |---|---|
 | `satellite_reception` | Por satélite: `track_passes` (padrão ligado; sem linha = padrão). A coluna `downlink_frequency_hz` é obsoleta: migrada no boot para `satellite_downlinks` e zerada |
-| `satellite_downlinks` | As portadoras do satélite: nome, frequência, ligado, ordem. `PUT /api/satellites/<code>/downlinks` substitui a lista inteira (a ordem importa: o primeiro ligado é a referência do Doppler) |
+| `satellite_downlinks` | As portadoras do satélite: nome, frequência, ligado, ordem, e o erro do oscilador medido pelo ajuste fino (`measured_offset_hz`, `measured_at`) — guardado durante a passagem só depois de a malha convergir (`db.afc_converged`), mantido ao editar sem mudar a frequência. `PUT /api/satellites/<code>/downlinks` substitui a lista inteira (a ordem importa: o primeiro ligado é a referência do Doppler) |
 | `pass_decisions` | `skip` ou `force` numa passagem. Desfazer = apagar a linha |
 | `pass_predictions` | Resultado do último replanejamento, **todas** as candidatas: `planned`, `conflict` (com quem venceu), `skipped`, `reception_off`. É como a API mostra as que perderam sem compartilhar memória com o laço |
 

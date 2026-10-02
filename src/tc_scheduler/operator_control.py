@@ -71,7 +71,7 @@ _RECEPTION_SQL = f"""
 """
 
 _DOWNLINKS_SQL = f"""
-    SELECT s.code, d.name, d.frequency_hz, d.enabled
+    SELECT s.code, d.name, d.frequency_hz, d.enabled, d.measured_offset_hz, d.measured_at
     FROM {CONTROL_SCHEMA}.satellite_downlinks d
     JOIN satellites s ON s.id = d.satellite_id
     ORDER BY s.code, d.position, d.id
@@ -100,6 +100,8 @@ class OperatorControl:
                 downlinks.setdefault(row["code"], []).append({
                     "name": row["name"], "frequency_hz": row["frequency_hz"],
                     "enabled": bool(row["enabled"]),
+                    "measured_offset_hz": row["measured_offset_hz"],
+                    "measured_at": _iso(row["measured_at"]),
                 })
 
         computed_at = max((p["computed_at"] for p in passes), default=None)
@@ -164,15 +166,29 @@ class OperatorControl:
 
         with self._engine.begin() as conn:
             satellite_id = self._satellite_id(conn, code)
+            # O desvio medido continua valendo para o downlink que ficou com o
+            # mesmo nome e a mesma frequência; para quem mudou de frequência
+            # (inclusive porque o operador aplicou a correção), ele não vale mais.
+            measured = {
+                (row["name"], row["frequency_hz"]): (row["measured_offset_hz"], row["measured_at"])
+                for row in conn.execute(text(f"""
+                    SELECT name, frequency_hz, measured_offset_hz, measured_at
+                    FROM {CONTROL_SCHEMA}.satellite_downlinks WHERE satellite_id = :id
+                """), {"id": satellite_id}).mappings()
+            }
             conn.execute(text(f"""
                 DELETE FROM {CONTROL_SCHEMA}.satellite_downlinks WHERE satellite_id = :id
             """), {"id": satellite_id})
             for position, downlink in enumerate(cleaned):
+                offset, at = measured.get((downlink["name"], downlink["frequency_hz"]), (None, None))
                 conn.execute(text(f"""
                     INSERT INTO {CONTROL_SCHEMA}.satellite_downlinks
-                        (satellite_id, name, frequency_hz, enabled, position)
-                    VALUES (:satellite_id, :name, :frequency_hz, :enabled, :position)
-                """), {"satellite_id": satellite_id, "position": position, **downlink})
+                        (satellite_id, name, frequency_hz, enabled, position,
+                         measured_offset_hz, measured_at)
+                    VALUES (:satellite_id, :name, :frequency_hz, :enabled, :position,
+                            :measured_offset_hz, :measured_at)
+                """), {"satellite_id": satellite_id, "position": position,
+                       "measured_offset_hz": offset, "measured_at": at, **downlink})
 
         logger.info("Downlinks de %s alterados pelo operador: %s", code,
                     ", ".join(f"{d['name']} {d['frequency_hz'] / 1e6:.4f} MHz" for d in cleaned)

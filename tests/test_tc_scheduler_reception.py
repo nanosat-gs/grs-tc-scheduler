@@ -121,7 +121,7 @@ class FakeStation:
         return {}
 
     def get_tracking(self):
-        return None
+        return getattr(self, "tracking", None)
 
 
 def scheduler_for(engine, station=None):
@@ -460,6 +460,40 @@ def test_painel_sabe_que_radio_ouve_cada_downlink(engine):
     assert "já ouve beacon" in downlinks["beacon-2"]["issue"]
 
 
+def test_desvio_medido_na_passagem_fica_guardado_e_sobrevive_a_edicao(engine):
+    """O ajuste fino aprende o erro do oscilador; o painel precisa dele depois
+    da passagem para sugerir a frequência corrigida."""
+    add_satellite(engine, "RX-1", 90001)
+    ctl = control(engine)
+    ctl.set_downlinks("RX-1", [BEACON, DATA])
+    station = FakeStation()
+    scheduler = scheduler_for(engine, station)
+    scheduler.replan()
+    bring_first_pass_to_now(engine)
+    scheduler.drive_passes()  # ativa
+
+    station.tracking = {"satellite_name": "RX-1", "downlinks": [
+        {"name": "beacon", "offset_hz": 1187.5, "afc_updates": 6, "afc_last_residual_hz": 12.0},
+        # Ainda convergindo: resíduo grande, não é medida do oscilador.
+        {"name": "dados", "offset_hz": -1500.0, "afc_updates": 1, "afc_last_residual_hz": -3000.0},
+    ]}
+    scheduler.drive_passes()  # em andamento: guarda o que foi medido
+
+    def downlinks():
+        reception = next(r for r in ctl.predictions()["reception"] if r["code"] == "RX-1")
+        return {d["name"]: d for d in reception["downlinks"]}
+
+    assert downlinks()["beacon"]["measured_offset_hz"] == 1187.5
+    assert downlinks()["beacon"]["measured_at"] is not None
+    assert downlinks()["dados"]["measured_offset_hz"] is None
+
+    # Editar sem mexer na frequência mantém a medida; aplicar a correção a apaga.
+    ctl.set_downlinks("RX-1", [{**BEACON, "enabled": True}, {**DATA, "enabled": False}])
+    assert downlinks()["beacon"]["measured_offset_hz"] == 1187.5
+    ctl.set_downlinks("RX-1", [{**BEACON, "frequency_hz": 145_901_188}, DATA])
+    assert downlinks()["beacon"]["measured_offset_hz"] is None
+
+
 def test_satelite_inexistente(engine):
     from tc_scheduler.operator_control import NotFound
 
@@ -471,3 +505,18 @@ def test_schema_check_confere_as_tabelas_de_controle(engine):
     from tc_scheduler import schema_check
 
     assert schema_check.check(engine) is True
+
+
+
+@pytest.mark.parametrize("downlink, converged", [
+    ({"afc_updates": 6, "afc_last_residual_hz": 12.0}, True),
+    ({"afc_updates": 6, "afc_last_residual_hz": -50.0}, True),
+    ({"afc_updates": 6, "afc_last_residual_hz": 575.0}, False),
+    ({"afc_updates": 2, "afc_last_residual_hz": 5.0}, False),
+    ({"afc_updates": 0, "afc_last_residual_hz": None}, False),
+    ({}, False),
+])
+def test_so_guarda_o_desvio_depois_de_convergir(downlink, converged):
+    from tc_scheduler.db import afc_converged
+
+    assert afc_converged(downlink) is converged

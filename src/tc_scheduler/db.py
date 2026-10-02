@@ -89,6 +89,14 @@ _CONTROL_DDL = (
         UNIQUE (satellite_id, name)
     )
     """,
+    # O erro do oscilador medido pelo ajuste fino (bloco FFT) na última
+    # passagem: o painel sugere corrigir a frequência com ele. Colunas
+    # adicionadas depois da tabela, daí o ALTER (CREATE TABLE IF NOT EXISTS
+    # não adiciona coluna em banco existente).
+    f"ALTER TABLE {CONTROL_SCHEMA}.satellite_downlinks "
+    f"ADD COLUMN IF NOT EXISTS measured_offset_hz DOUBLE PRECISION",
+    f"ALTER TABLE {CONTROL_SCHEMA}.satellite_downlinks "
+    f"ADD COLUMN IF NOT EXISTS measured_at TIMESTAMPTZ",
     f"""
     CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.pass_decisions (
         id            BIGSERIAL PRIMARY KEY,
@@ -127,6 +135,7 @@ CONTROL_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "satellite_downlinks": (
         "id", "satellite_id", "name", "frequency_hz", "enabled", "position", "updated_at",
+        "measured_offset_hz", "measured_at",
     ),
     "pass_decisions": ("id", "satellite_id", "predicted_aos", "decision", "created_at"),
     "pass_predictions": (
@@ -388,6 +397,41 @@ def fetch_active_pass(conn: Connection) -> Optional[dict[str, Any]]:
 
 
 # --- Escrita ----------------------------------------------------------------
+
+# Quando o desvio do ajuste fino vale como medida do oscilador: a malha já
+# deu alguns passos E o último resíduo é pequeno. Antes disso ela ainda está
+# convergindo, e o valor é um ponto no meio do caminho — foi o que aconteceu
+# quando o Station Manager reiniciou no meio de uma passagem: o painel sugeriu
+# +898 Hz para um oscilador de +1200.
+CONVERGED_MIN_UPDATES = 3
+CONVERGED_MAX_RESIDUAL_HZ = 50.0
+
+
+def afc_converged(downlink: dict) -> bool:
+    residual = downlink.get("afc_last_residual_hz")
+    return (int(downlink.get("afc_updates") or 0) >= CONVERGED_MIN_UPDATES
+            and residual is not None and abs(float(residual)) <= CONVERGED_MAX_RESIDUAL_HZ)
+
+
+def record_measured_offsets(conn: Connection, satellite_id: int, downlinks: list[dict]) -> int:
+    """Guarda o desvio que o ajuste fino aprendeu em cada downlink.
+
+    Só quando a malha convergiu (ver afc_converged): um desvio zero porque
+    nenhuma rajada foi medida, ou um desvio no meio da convergência, não é
+    medida do oscilador.
+    """
+    updated = 0
+    for downlink in downlinks or []:
+        if not afc_converged(downlink):
+            continue
+        updated += conn.execute(text(f"""
+            UPDATE {CONTROL_SCHEMA}.satellite_downlinks
+            SET measured_offset_hz = :offset, measured_at = now()
+            WHERE satellite_id = :satellite_id AND name = :name
+        """), {"offset": float(downlink["offset_hz"]), "satellite_id": satellite_id,
+               "name": downlink["name"]}).rowcount
+    return updated
+
 
 def clear_planned_passes(conn: Connection) -> int:
     """Descarta o plano ainda não iniciado, devolvendo os telecomandos à fila.

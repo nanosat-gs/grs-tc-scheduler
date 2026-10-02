@@ -386,6 +386,16 @@ class Scheduler:
                 active["satellite_name"],
             )
             self._activate(active)
+            return
+
+        # O ajuste fino aprende o erro do oscilador durante a passagem; guardá-lo
+        # é o que deixa o painel sugerir a frequência corrigida depois.
+        try:
+            with self._engine.begin() as conn:
+                db.record_measured_offsets(conn, active["satellite_id"],
+                                           tracking.get("downlinks") or [])
+        except Exception:
+            logger.exception("Falha ao guardar o desvio medido de %s", active["satellite_name"])
 
     # --- Laço principal -----------------------------------------------------
 
