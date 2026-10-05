@@ -103,7 +103,8 @@ arranjo do `grs-iq-recorder`.
 
 | Tabela | Colunas | Uso |
 |---|---|---|
-| `satellite_reception` | `satellite_id` (PK, FK `satellites` ON DELETE CASCADE), `track_passes`, `downlink_frequency_hz`, `updated_at` | Rastrear passagens para recepção e a portadora de downlink. Sem linha = padrão (rastrear, sem frequência) |
+| `satellite_reception` | `satellite_id` (PK, FK `satellites` ON DELETE CASCADE), `track_passes`, `downlink_frequency_hz`, `updated_at` | Rastrear passagens para recepção. Sem linha = padrão (rastrear). `downlink_frequency_hz` é **obsoleta**: migrada no boot para `satellite_downlinks` e zerada |
+| `satellite_downlinks` | `id`, `satellite_id` (FK `satellites` ON DELETE CASCADE), `name`, `frequency_hz`, `enabled`, `position`, `updated_at`, `measured_offset_hz`, `measured_at`; único por (`satellite_id`, `name`) | As portadoras do satélite, em ordem (o primeiro ligado é a referência do Doppler), e o erro do oscilador que o ajuste fino aprendeu na última passagem. As duas colunas `measured_*` entram por `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` |
 | `pass_decisions` | `id`, `satellite_id`, `predicted_aos`, `decision` (`skip`/`force`), `created_at` | Decisão do operador sobre uma passagem, casada por satélite + AOS ±10 min. Podada 6 h depois |
 | `pass_predictions` | `satellite_id`, `aos_time`, `los_time`, `culmination_time`, `max_elevation_deg`, `outcome`, `lost_to_satellite_id`, `lost_to_aos_time`, `forced`, `carries_telecommands`, `telecommand_count`, `computed_at` | Todas as candidatas do último replanejamento e o resultado de cada uma. Substituída inteira na mesma transação que grava as `planned` |
 
