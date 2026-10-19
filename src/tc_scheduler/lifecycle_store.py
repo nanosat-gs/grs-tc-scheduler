@@ -221,9 +221,20 @@ class PostgresLifecycleStore:
             """), {"now": now}).scalars())
 
     def awaiting(self, satellite_id: int) -> bool:
+        """Há um TC deste satélite no ar esperando resposta?
+
+        Só conta o `sent` que tem transmissão com `ack`. Um `sent` antigo,
+        inferido no fim de uma passagem antes da fatia de uplink, nunca vai
+        receber resposta nem vencer prazo (não há transmissão para medir), e
+        travaria o stop-and-wait do satélite para sempre.
+        """
         with self._engine.connect() as conn:
-            return conn.execute(text("""
-                SELECT 1 FROM telecommands WHERE satellite_id = :s AND status = 'sent' LIMIT 1
+            return conn.execute(text(f"""
+                SELECT 1 FROM telecommands tc
+                WHERE tc.satellite_id = :s AND tc.status = 'sent'
+                  AND EXISTS (SELECT 1 FROM {SCHEMA}.uplink_transmissions t
+                              WHERE t.telecommand_id = tc.id AND t.status = 'ack')
+                LIMIT 1
             """), {"s": satellite_id}).first() is not None
 
     def next_telecommand(self, satellite_id: int, pass_id: Optional[int]) -> Optional[int]:
