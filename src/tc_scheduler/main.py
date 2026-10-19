@@ -111,6 +111,8 @@ class Scheduler:
         # Com uplink: manda, espera a resposta e fecha cada TC (tc_lifecycle.py).
         # Sem: o `sent` continua sendo inferido no fim da passagem.
         self._lifecycle = lifecycle
+        self._lifecycle_error: Optional[str] = None
+        self._lifecycle_error_at = 0.0
         self._engine = engine
         self._station = station
         self._last_replan = 0.0
@@ -352,7 +354,22 @@ class Scheduler:
 
         if self._lifecycle is not None:
             # Fora da transação acima: o pedido ao uplink espera a rajada sair.
+            self._tick_lifecycle(now, active)
+
+    def _tick_lifecycle(self, now: datetime, active: Optional[dict]) -> None:
+        """O ciclo de vida não pode derrubar o rastreio. E, com o decoder ou o
+        grs-uplink fora do ar, a mesma falha se repetiria a cada tick: loga
+        uma vez por minuto, e quando muda."""
+        try:
             self._lifecycle.tick(now, active)
+            if self._lifecycle_error is not None:
+                logger.info("Ciclo de vida do TC voltou a funcionar.")
+                self._lifecycle_error = None
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}".splitlines()[0][:300]
+            if message != self._lifecycle_error or time.monotonic() - self._lifecycle_error_at > 60:
+                logger.warning("Ciclo de vida do TC falhou (%s); tentando no próximo tick.", message)
+                self._lifecycle_error, self._lifecycle_error_at = message, time.monotonic()
 
     def _activate(self, scheduled_pass: dict) -> None:
         name = scheduled_pass["satellite_name"]
