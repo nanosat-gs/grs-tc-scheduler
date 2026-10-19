@@ -138,3 +138,57 @@ def _check_control_tables(engine) -> bool:
             )
             ok = False
     return ok
+
+
+# O que o ciclo de vida do TC (tc_lifecycle.py) lê de OUTROS serviços, em
+# `mission_control`. Só conferido com UPLINK_ENABLED. Divergência aqui é
+# aviso, não erro: o grs-uplink e o decoder podem subir depois do Scheduler,
+# e as tabelas deles aparecem quando eles sobem.
+UPLINK_READ_COLUMNS: dict[str, tuple[str, ...]] = {
+    # grs-uplink, docs/schema-contract.md
+    "uplink_transmissions": (
+        "id", "telecommand_id", "status", "ended_at", "tc_pkt_id",
+        "expected_response_pkt_id", "station_callsign",
+    ),
+    # grs-telemetry-decoder, docs/schema-contract.md
+    "decoded_frames": (
+        "id", "raw_packet_id", "received_at", "radio", "status", "ngham_payload",
+        "pkt_id", "detail",
+    ),
+    "fs2_tc_feedback": ("decoded_frame_id", "error_code"),
+}
+
+
+def check_uplink(engine) -> bool:
+    from sqlalchemy import text
+
+    from tc_scheduler.db import CONTROL_SCHEMA
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT table_name, column_name FROM information_schema.columns
+                WHERE table_schema = :schema AND table_name = ANY(:tables)
+            """), {"schema": CONTROL_SCHEMA, "tables": list(UPLINK_READ_COLUMNS)}).fetchall()
+    except Exception as error:
+        logger.warning("Não deu para conferir as tabelas do uplink: %s", error)
+        return False
+
+    found: dict[str, set[str]] = {}
+    for table_name, column_name in rows:
+        found.setdefault(table_name, set()).add(column_name)
+
+    ok = True
+    for table, columns in UPLINK_READ_COLUMNS.items():
+        if table not in found:
+            logger.warning("Uplink: %s.%s ainda não existe (o serviço dono ainda não subiu?). "
+                           "O ciclo de vida do TC falha até ela aparecer.", CONTROL_SCHEMA, table)
+            ok = False
+            continue
+        missing = sorted(set(columns) - found[table])
+        if missing:
+            logger.warning("Uplink: %s.%s sem as colunas %s.", CONTROL_SCHEMA, table, ", ".join(missing))
+            ok = False
+    if ok:
+        logger.info("Tabelas do uplink (grs-uplink, decoder) conferem.")
+    return ok

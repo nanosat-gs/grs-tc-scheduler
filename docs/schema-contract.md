@@ -44,7 +44,8 @@ Generator. O que faltava era o contrato ser **visível** e **verificado**.
 | `satellite_id` | A quem o comando se destina |
 | `scheduled_pass_id` | **Escrito**: a passagem em que o comando sai, ou NULL |
 | `command_type` | Exibido no painel |
-| `status` | **Escrito**: `pending` → `queued` → `sent` |
+| `status` | **Escrito**: `pending` → `queued` → `sent`; com uplink, também `response_received`, `confirmed`, `failed`, `no_response` (ver "O ciclo de vida com uplink") |
+| `status_message`, `sent_at`, `confirmed_at` | **Escritos** pelo ciclo de vida com uplink |
 | `priority` | Primeiro critério de pontuação da passagem |
 
 ### `scheduled_passes` — leitura e escrita (o Scheduler é quem cria)
@@ -77,6 +78,7 @@ se paga.
 | `telecommand_id` | A qual comando o registro se refere |
 | `status` | O estado que motivou o registro |
 | `message` | **Onde mora a honestidade do sistema** — ver abaixo |
+| `details` | Com uplink: os IDs da transmissão e do quadro que provaram cada transição |
 
 ## Uma nota sobre o `sent`
 
@@ -93,6 +95,38 @@ com evidência será distinguível destes pela mensagem.
 Passagem `missed` **devolve** os comandos à fila: ali a antena nem chegou a
 apontar.
 
+## O ciclo de vida com uplink (`UPLINK_ENABLED=1`)
+
+Com o uplink ligado, o `sent` deixa de ser inferido. O módulo `tc_lifecycle` é o
+único que escreve `telecommands.status`, a partir de fatos que outros serviços
+gravam:
+
+| Transição | Fato | De quem |
+|---|---|---|
+| `pending`/`queued` → `sent` | o rádio confirmou a rajada (`ack`, prova N1) | `grs-uplink`: `mission_control.uplink_transmissions` |
+| `sent` → `confirmed` | resposta casada e decodificada: pong, ou `0x13` com código 0 | `grs-telemetry-decoder`: `decoded_frames`, `fs2_tc_feedback` |
+| `sent` → `failed` | `0x13` com código ≠ 0 (o motivo vai em `status_message`); ou o uplink rejeitou o TC no solo | idem, ou a resposta do `grs-uplink` |
+| `sent` → `response_received` | resposta casada, conteúdo não decodificado (`not_implemented`, `layout_mismatch`...) | `decoded_frames` |
+| `sent` → `no_response` | prazo vencido sem resposta | o relógio |
+| `response_received`/`no_response` → `confirmed`/`failed` | a resposta chegou atrasada, ou foi reprocessada por um decoder novo | idem |
+
+**Um TC por vez por satélite:** o próximo só sobe depois da resposta ou do prazo.
+
+**Casar:** o callsign de quem pediu (bytes 8–14 da resposta) é o da estação, o
+tipo é o esperado e, no `0x13`, o ID ecoado é o que subiu. A regra fica em
+`tc_responses.match_rule`.
+
+No fim da passagem, o que não chegou a subir volta para `pending`.
+
+**Lido de outros serviços** (em `mission_control`; conferido no boot por
+`schema_check.check_uplink`, só como aviso):
+
+| Tabela | Colunas | Dono |
+|---|---|---|
+| `uplink_transmissions` | `id`, `telecommand_id`, `status`, `ended_at`, `tc_pkt_id`, `expected_response_pkt_id`, `station_callsign` | `grs-uplink` |
+| `decoded_frames` | `id`, `raw_packet_id`, `received_at`, `radio`, `status`, `ngham_payload`, `pkt_id`, `detail` | `grs-telemetry-decoder` |
+| `fs2_tc_feedback` | `decoded_frame_id`, `error_code` | `grs-telemetry-decoder` |
+
 ## As tabelas que são deste serviço: `mission_control`
 
 O controle do operador sobre passagens precisava de tabelas, e o schema acima
@@ -106,6 +140,9 @@ arranjo do `grs-iq-recorder`.
 | `satellite_reception` | `satellite_id` (PK, FK `satellites` ON DELETE CASCADE), `track_passes`, `downlink_frequency_hz`, `updated_at` | Rastrear passagens para recepção. Sem linha = padrão (rastrear). `downlink_frequency_hz` é **obsoleta**: migrada no boot para `satellite_downlinks` e zerada |
 | `satellite_downlinks` | `id`, `satellite_id` (FK `satellites` ON DELETE CASCADE), `name`, `frequency_hz`, `enabled`, `position`, `updated_at`, `measured_offset_hz`, `measured_at`; único por (`satellite_id`, `name`) | As portadoras do satélite, em ordem (o primeiro ligado é a referência do Doppler), e o erro do oscilador que o ajuste fino aprendeu na última passagem. As duas colunas `measured_*` entram por `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` |
 | `pass_decisions` | `id`, `satellite_id`, `predicted_aos`, `decision` (`skip`/`force`), `created_at` | Decisão do operador sobre uma passagem, casada por satélite + AOS ±10 min. Podada 6 h depois |
+| `tc_responses` | `id`, `telecommand_id` (FK `telecommands` ON DELETE CASCADE), `transmission_id`, `decoded_frame_id` (único), `raw_packet_id`, `pkt_id`, `radio`, `received_at`, `frame_status`, `requester_callsign`, `echoed_tc_id`, `error_code`, `match_rule`, `decision`, `matched_at` | Cada resposta do satélite casada com uma transmissão. Sem FK para as tabelas do uplink e do decoder, que podem subir depois |
+| `uplink_sessions` | `id`, `satellite_id` (FK `satellites`), `opened_at`, `until_time`, `closed_at`, `opened_by` | Sessão manual de uplink aberta pela API. A API escreve, o laço lê |
+| `tc_lifecycle_state` | `key`, `value` | Até onde o ciclo de vida leu `decoded_frames` (`last_decoded_frame_id`) |
 | `pass_predictions` | `satellite_id`, `aos_time`, `los_time`, `culmination_time`, `max_elevation_deg`, `outcome`, `lost_to_satellite_id`, `lost_to_aos_time`, `forced`, `carries_telecommands`, `telecommand_count`, `computed_at` | Todas as candidatas do último replanejamento e o resultado de cada uma. Substituída inteira na mesma transação que grava as `planned` |
 
 `schema_check.py` também confere estas colunas. Divergência aqui só acontece

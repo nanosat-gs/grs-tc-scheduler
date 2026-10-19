@@ -37,6 +37,7 @@ from spacelab_tracking import (
 )
 
 from tc_scheduler import config, db, schema_check
+from tc_scheduler.tc_lifecycle import Lifecycle
 from tc_scheduler.planner import (
     PassCandidate,
     is_worth_tracking,
@@ -105,7 +106,11 @@ def find_decision(decisions: list[dict], satellite_id: int, aos: datetime) -> Op
 
 
 class Scheduler:
-    def __init__(self, engine, station: StationManagerClient) -> None:
+    def __init__(self, engine, station: StationManagerClient,
+                 lifecycle: Optional[Lifecycle] = None) -> None:
+        # Com uplink: manda, espera a resposta e fecha cada TC (tc_lifecycle.py).
+        # Sem: o `sent` continua sendo inferido no fim da passagem.
+        self._lifecycle = lifecycle
         self._engine = engine
         self._station = station
         self._last_replan = 0.0
@@ -311,7 +316,13 @@ class Scheduler:
             finished = db.close_finished_passes(conn, now)
             for pass_id in finished:
                 logger.info("Passagem %d concluída.", pass_id)
-            if finished:
+            if finished and self._lifecycle is not None:
+                # Com uplink, `sent` só vem do ack do rádio. O que a janela não
+                # chegou a transmitir volta para a fila da próxima passagem.
+                released = db.release_telecommands(conn, finished)
+                if released:
+                    logger.info("%d telecomandos não transmitidos voltaram à fila.", released)
+            elif finished:
                 # A janela foi rastreada até o fim, então os comandos dela
                 # saem da fila. Sem encoder não há confirmação de transmissão:
                 # o motivo da marcação fica registrado em execution_logs.
@@ -338,6 +349,10 @@ class Scheduler:
             self._activate(to_activate)
         elif active is not None:
             self._ensure_still_tracking(active)
+
+        if self._lifecycle is not None:
+            # Fora da transação acima: o pedido ao uplink espera a rajada sair.
+            self._lifecycle.tick(now, active)
 
     def _activate(self, scheduled_pass: dict) -> None:
         name = scheduled_pass["satellite_name"]
@@ -452,10 +467,13 @@ def main() -> None:
     # no meio de um ciclo (logado como "Falha no ciclo do scheduler", a
     # mensagem mais genérica possível) numa linha explícita no boot.
     schema_check.check(engine)
+    if config.UPLINK_ENABLED:
+        schema_check.check_uplink(engine)
     station = StationManagerClient(
         config.STATION_MANAGER_ADDRESS, config.ZMQ_REQUEST_TIMEOUT_MS
     )
-    scheduler = Scheduler(engine, station)
+    lifecycle, uplink = _build_lifecycle(engine)
+    scheduler = Scheduler(engine, station, lifecycle)
 
     api_data = None
     if config.API_ENABLED and not args.no_api:
@@ -469,9 +487,35 @@ def main() -> None:
         scheduler.run()
     finally:
         station.close()
+        if uplink is not None:
+            uplink.close()
         engine.dispose()
         if api_data is not None:
             api_data.close()
+
+
+def _build_lifecycle(engine):
+    """O ciclo de vida do TC, se UPLINK_ENABLED. Devolve (lifecycle, cliente)."""
+    if not config.UPLINK_ENABLED:
+        logger.info("Uplink desligado (UPLINK_ENABLED): `sent` segue inferido no fim da passagem.")
+        return None, None
+
+    from datetime import timedelta
+
+    from tc_scheduler.lifecycle_store import PostgresLifecycleStore
+    from tc_scheduler.tc_lifecycle import PING_ANSWER, TC_FEEDBACK, LifecycleSettings
+    from tc_scheduler.uplink_client import UplinkClient
+
+    uplink = UplinkClient(config.UPLINK_ADDRESS, config.UPLINK_REQUEST_TIMEOUT_MS)
+    settings = LifecycleSettings(
+        response_timeouts={PING_ANSWER: timedelta(seconds=config.UPLINK_PING_TIMEOUT_S),
+                           TC_FEEDBACK: timedelta(seconds=config.UPLINK_FEEDBACK_TIMEOUT_S)},
+        late_window=timedelta(seconds=config.UPLINK_LATE_WINDOW_S),
+        retry_after=timedelta(seconds=config.UPLINK_RETRY_S),
+    )
+    logger.info("Uplink ligado: %s; um TC por vez, resposta em até %.0f s (pong) / %.0f s (feedback).",
+                config.UPLINK_ADDRESS, config.UPLINK_PING_TIMEOUT_S, config.UPLINK_FEEDBACK_TIMEOUT_S)
+    return Lifecycle(PostgresLifecycleStore(engine), uplink, settings), uplink
 
 
 def _start_api():
@@ -495,10 +539,15 @@ def _start_api():
             return None
         # Engine próprio também para o controle do operador: a leitura do
         # painel e as ações dele não disputam o mesmo pool de duas conexões.
-        control = OperatorControl(db.build_engine(config.DATABASE_URL),
-                                  radios=parse_radios(config.STATION_RADIOS))
+        control_engine = db.build_engine(config.DATABASE_URL)
+        control = OperatorControl(control_engine, radios=parse_radios(config.STATION_RADIOS))
+        uplink_control = None
+        if config.UPLINK_ENABLED:
+            from tc_scheduler.uplink_control import UplinkControl
+
+            uplink_control = UplinkControl(control_engine, max_session_s=config.UPLINK_MAX_SESSION_S)
         thread = threading.Thread(
-            target=api.create_app(data, control).run,
+            target=api.create_app(data, control, uplink_control).run,
             # threaded=True: sem isso, uma consulta lenta ao banco travaria
             # qualquer outra requisição, inclusive o healthcheck do compose.
             kwargs={"host": config.API_HOST, "port": config.API_PORT,

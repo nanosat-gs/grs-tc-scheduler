@@ -67,3 +67,23 @@ MIN_ELEVATION_DEG = tracking_config.MIN_ELEVATION_DEG
 # vírgula). O mesmo valor vai ao Station Manager, que é quem roteia; aqui só
 # serve para o painel dizer que rádio ouve cada downlink cadastrado.
 STATION_RADIOS = os.getenv("STATION_RADIOS", "")
+
+# --- Uplink: o ciclo de vida do telecomando (tc_lifecycle.py) ----------------
+# Desligado, o Scheduler faz o que fazia antes da fatia de uplink: marca
+# `sent` por inferência no fim da passagem rastreada. Ligado, só o `ack` do
+# rádio (via grs-uplink) vira `sent`, e a resposta do satélite fecha o TC.
+UPLINK_ENABLED = os.getenv("UPLINK_ENABLED", "0").lower() in ("1", "true", "yes")
+UPLINK_ADDRESS = os.getenv("UPLINK_ADDRESS", "tcp://grs-uplink:5593")
+# Cobre a rajada (~0,6 s), o prazo do rádio no grs-uplink (10 s) e folga.
+UPLINK_REQUEST_TIMEOUT_MS = int(os.getenv("UPLINK_REQUEST_TIMEOUT_MS", "20000"))
+# Quanto esperar a resposta depois do fim da rajada, por tipo de resposta.
+# O pong volta em segundos; o feedback pode esperar o mission manager (5 s).
+UPLINK_PING_TIMEOUT_S = float(os.getenv("UPLINK_PING_TIMEOUT_S", "15"))
+UPLINK_FEEDBACK_TIMEOUT_S = float(os.getenv("UPLINK_FEEDBACK_TIMEOUT_S", "30"))
+# Resposta que chega depois do prazo ainda casa (no_response -> confirmed)
+# dentro desta janela: um reprocessamento do decoder, um quadro atrasado.
+UPLINK_LATE_WINDOW_S = float(os.getenv("UPLINK_LATE_WINDOW_S", "600"))
+# Depois de o rádio recusar ou falhar, espera isto antes de tentar de novo.
+UPLINK_RETRY_S = float(os.getenv("UPLINK_RETRY_S", "15"))
+# Teto de uma sessão manual aberta pela API.
+UPLINK_MAX_SESSION_S = float(os.getenv("UPLINK_MAX_SESSION_S", "3600"))

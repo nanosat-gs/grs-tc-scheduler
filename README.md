@@ -26,6 +26,14 @@ Faz parte da estação terrestre orquestrada em
 5. Durante a passagem, consulta o Station Manager e guarda o **erro do
    oscilador** que o ajuste fino aprendeu, depois que ele converge.
 6. Serve o plano e recebe as ações do operador por HTTP em `:5591`.
+7. **Com `UPLINK_ENABLED=1`:** fecha a malha de cada telecomando
+   (`tc_lifecycle.py`). Durante a passagem, ou numa sessão manual:
+   - pede ao `grs-uplink` (:5593) que transmita **um TC por vez**;
+   - marca `sent` só com o `ack` do rádio;
+   - casa a resposta do satélite, decodificada pelo `grs-telemetry-decoder`, e
+     fecha o TC em `confirmed`, `failed`, `response_received` ou `no_response`.
+
+   Ver `docs/schema-contract.md`, "O ciclo de vida com uplink".
 
 O operador pode **pular**, **forçar** ou **desfazer** uma passagem, ligar ou
 desligar a recepção por satélite e cadastrar os downlinks (nome e frequência) —
@@ -47,6 +55,9 @@ não tem autenticação.
 | `PUT` | `/api/satellites/<code>/reception` | Liga/desliga o rastreio de passagens para recepção |
 | `PUT` | `/api/satellites/<code>/downlinks` | Substitui a lista: `{"downlinks": [{name, frequency_hz, enabled}]}` — a ordem importa: o primeiro ligado é a referência do Doppler |
 | `POST` | `/api/tle/refresh` | Revalida os elementos orbitais no CelesTrak |
+| `POST` | `/api/uplink/session` | Com uplink: `{"satellite": código ou id, "duration_s"}` abre uma sessão manual de uplink (contato fora de passagem, ou o simulador) |
+| `DELETE` | `/api/uplink/session/<id>` | Fecha a sessão |
+| `GET` | `/api/uplink` | Sessões abertas e as últimas transmissões, com o status do TC e as respostas casadas |
 
 Erros das ações: 400 pedido inválido, 404 satélite inexistente, 503 banco fora.
 

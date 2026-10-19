@@ -31,25 +31,26 @@ from flask import Flask, jsonify, request
 logger = logging.getLogger(__name__)
 
 
-def create_app(station_data: Any, control: Any = None) -> Flask:
+def create_app(station_data: Any, control: Any = None, uplink: Any = None) -> Flask:
     """Monta a aplicação em cima de um `station_data` já construído.
 
     Recebe as dependências prontas em vez de construí-las: é o que permite
     testar a API inteira contra dublês, sem Postgres nenhum. Sem `control`, as
-    rotas do operador respondem 503 e a leitura segue funcionando.
+    rotas do operador respondem 503 e a leitura segue funcionando. Sem
+    `uplink` (UPLINK_ENABLED desligado), as rotas de uplink respondem 503.
     """
     from tc_scheduler.operator_control import ControlError, NotFound
 
     app = Flask(__name__)
 
-    def control_call(action):
+    def control_call(action, target=None):
         """Traduz o resultado de uma ação do operador em resposta HTTP.
 
         400 para pedido inválido (a mensagem vai para a tela como está), 404
         para satélite inexistente, 503 para banco fora — três coisas que o
         painel mostra de jeitos diferentes.
         """
-        if control is None:
+        if target is None and control is None:
             return jsonify({"error": "controle de passagens indisponível"}), 503
         try:
             return jsonify(action())
@@ -130,6 +131,29 @@ def create_app(station_data: Any, control: Any = None) -> Flask:
         if detail is None:
             return jsonify({"error": f"satélite {code} não encontrado"}), 404
         return jsonify(detail)
+
+    # --- uplink: sessões manuais e o que subiu (uplink_control.py) ---------------
+
+    @app.get("/api/uplink")
+    def uplink_overview():
+        if uplink is None:
+            return jsonify({"error": "uplink desligado (UPLINK_ENABLED)"}), 503
+        return control_call(uplink.overview, uplink)
+
+    @app.post("/api/uplink/session")
+    def uplink_open_session():
+        """{satellite: código ou id, duration_s}: o Scheduler transmite os TCs
+        pendentes desse satélite, um por vez, até a sessão acabar."""
+        if uplink is None:
+            return jsonify({"error": "uplink desligado (UPLINK_ENABLED)"}), 503
+        body = request.get_json(silent=True)
+        return control_call(lambda: uplink.open_session(body), uplink)
+
+    @app.delete("/api/uplink/session/<int:session_id>")
+    def uplink_close_session(session_id: int):
+        if uplink is None:
+            return jsonify({"error": "uplink desligado (UPLINK_ENABLED)"}), 503
+        return control_call(lambda: uplink.close_session(session_id), uplink)
 
     @app.post("/api/tle/refresh")
     def refresh_tle():

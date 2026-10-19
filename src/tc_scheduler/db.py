@@ -108,6 +108,53 @@ _CONTROL_DDL = (
     """,
     f"CREATE INDEX IF NOT EXISTS pass_decisions_satellite_aos_idx "
     f"ON {CONTROL_SCHEMA}.pass_decisions (satellite_id, predicted_aos)",
+    # --- Ciclo de vida do telecomando (tc_lifecycle.py) ----------------------
+    # Cada resposta do satélite casada com uma transmissão. A chave é o quadro
+    # decodificado: o mesmo raw packet reprocessado por outra versão do
+    # decoder vira outra linha, e pode avançar o status (response_received ->
+    # confirmed). Sem FK para uplink_transmissions e decoded_frames: são
+    # tabelas de outros serviços, que podem subir depois deste.
+    f"""
+    CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.tc_responses (
+        id                 BIGSERIAL PRIMARY KEY,
+        telecommand_id     INTEGER NOT NULL REFERENCES telecommands(id) ON DELETE CASCADE,
+        transmission_id    BIGINT NOT NULL,
+        decoded_frame_id   BIGINT NOT NULL UNIQUE,
+        raw_packet_id      BIGINT NOT NULL,
+        pkt_id             SMALLINT NOT NULL,
+        radio              TEXT,
+        received_at        TIMESTAMPTZ NOT NULL,
+        frame_status       TEXT NOT NULL,
+        requester_callsign TEXT NOT NULL,
+        echoed_tc_id       SMALLINT,
+        error_code         SMALLINT,
+        match_rule         TEXT NOT NULL,
+        decision           TEXT NOT NULL,
+        matched_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    f"CREATE INDEX IF NOT EXISTS tc_responses_telecommand_idx "
+    f"ON {CONTROL_SCHEMA}.tc_responses (telecommand_id, received_at)",
+    # Sessão de uplink aberta pelo operador fora de uma passagem planejada
+    # (contato manual, ou o simulador sem esperar uma passagem real). A API
+    # escreve, o laço lê: as duas threads não compartilham objeto nenhum.
+    f"""
+    CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.uplink_sessions (
+        id            BIGSERIAL PRIMARY KEY,
+        satellite_id  INTEGER NOT NULL REFERENCES satellites(id) ON DELETE CASCADE,
+        opened_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+        until_time    TIMESTAMPTZ NOT NULL,
+        closed_at     TIMESTAMPTZ,
+        opened_by     TEXT
+    )
+    """,
+    # Até onde o ciclo de vida já leu decoded_frames.
+    f"""
+    CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.tc_lifecycle_state (
+        key    TEXT PRIMARY KEY,
+        value  BIGINT NOT NULL
+    )
+    """,
     f"""
     CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.pass_predictions (
         id                   BIGSERIAL PRIMARY KEY,
@@ -138,6 +185,13 @@ CONTROL_COLUMNS: dict[str, tuple[str, ...]] = {
         "measured_offset_hz", "measured_at",
     ),
     "pass_decisions": ("id", "satellite_id", "predicted_aos", "decision", "created_at"),
+    "tc_responses": (
+        "id", "telecommand_id", "transmission_id", "decoded_frame_id", "raw_packet_id", "pkt_id",
+        "radio", "received_at", "frame_status", "requester_callsign", "echoed_tc_id",
+        "error_code", "match_rule", "decision", "matched_at",
+    ),
+    "uplink_sessions": ("id", "satellite_id", "opened_at", "until_time", "closed_at", "opened_by"),
+    "tc_lifecycle_state": ("key", "value"),
     "pass_predictions": (
         "satellite_id", "aos_time", "los_time", "culmination_time", "max_elevation_deg",
         "outcome", "lost_to_satellite_id", "lost_to_aos_time", "forced",
