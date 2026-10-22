@@ -177,7 +177,7 @@ class LifecycleStore(Protocol):
                        decision: Decision, rule: str) -> bool: ...
     def expired(self, now: datetime, timeouts: dict[int, timedelta]) -> list[Transmission]: ...
     def mark_no_response(self, transmission: Transmission, now: datetime, timeout: timedelta) -> bool: ...
-    def open_sessions(self, now: datetime) -> list[int]: ...
+    def open_sessions(self, now: datetime) -> dict[int, bool]: ...
     def awaiting(self, satellite_id: int) -> bool: ...
     def next_telecommand(self, satellite_id: int, pass_id: Optional[int]) -> Optional[int]: ...
     def mark_sent(self, telecommand_id: int, reply: dict[str, Any], now: datetime) -> bool: ...
@@ -190,7 +190,7 @@ class UplinkUnavailable(RuntimeError):
 
 
 class Uplink(Protocol):
-    def transmit(self, telecommand_id: int) -> dict[str, Any]: ...
+    def transmit(self, telecommand_id: int, allow_no_doppler: bool = False) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -264,15 +264,17 @@ class Lifecycle:
     # 3. o próximo TC --------------------------------------------------------------------
 
     def _send(self, now: datetime, active_pass: Optional[dict[str, Any]], report: TickReport) -> None:
-        # Satélite -> passagem (só os `queued` dela) ou None (sessão manual:
-        # `pending` e `queued`). A sessão manual vale por cima da passagem.
-        sessions: dict[int, Optional[int]] = {}
+        # Satélite -> (passagem, liberação sem Doppler). Na passagem: só os
+        # `queued` dela, e o Doppler é obrigatório. Na sessão manual: `pending`
+        # e `queued`, e o Doppler só deixa de ser obrigatório se o operador
+        # liberou ao abrir a sessão. A sessão manual vale por cima da passagem.
+        sessions: dict[int, tuple[Optional[int], bool]] = {}
         if active_pass is not None:
-            sessions[active_pass["satellite_id"]] = active_pass["id"]
-        for satellite_id in self._store.open_sessions(now):
-            sessions[satellite_id] = None
+            sessions[active_pass["satellite_id"]] = (active_pass["id"], False)
+        for satellite_id, allow_no_doppler in self._store.open_sessions(now).items():
+            sessions[satellite_id] = (None, allow_no_doppler)
 
-        for satellite_id, pass_id in sessions.items():
+        for satellite_id, (pass_id, allow_no_doppler) in sessions.items():
             retry_at = self._retry_at.get(satellite_id)
             if retry_at is not None and now < retry_at:
                 continue
@@ -281,12 +283,12 @@ class Lifecycle:
             telecommand_id = self._store.next_telecommand(satellite_id, pass_id)
             if telecommand_id is None:
                 continue
-            self._transmit(satellite_id, telecommand_id, now, report)
+            self._transmit(satellite_id, telecommand_id, now, report, allow_no_doppler)
 
     def _transmit(self, satellite_id: int, telecommand_id: int, now: datetime,
-                  report: TickReport) -> None:
+                  report: TickReport, allow_no_doppler: bool = False) -> None:
         try:
-            reply = self._uplink.transmit(telecommand_id)
+            reply = self._uplink.transmit(telecommand_id, allow_no_doppler=allow_no_doppler)
         except UplinkUnavailable as error:
             self._retry_at[satellite_id] = now + self._settings.retry_after
             logger.warning("Uplink indisponível para o TC %d: %s", telecommand_id, error)

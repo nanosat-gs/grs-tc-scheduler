@@ -35,10 +35,13 @@ class UplinkClient:
             self._socket.close(linger=0)
             self._socket = None
 
-    def transmit(self, telecommand_id: int) -> dict[str, Any]:
+    def transmit(self, telecommand_id: int, allow_no_doppler: bool = False) -> dict[str, Any]:
         socket = self._connect()
+        request = {"op": "transmit", "telecommand_id": telecommand_id}
+        if allow_no_doppler:
+            request["allow_no_doppler"] = True
         try:
-            socket.send(json.dumps({"op": "transmit", "telecommand_id": telecommand_id}).encode())
+            socket.send(json.dumps(request).encode())
             if not socket.poll(self._timeout_ms):
                 self._discard()
                 raise UplinkUnavailable(f"o grs-uplink em {self._address} não respondeu "

@@ -213,12 +213,15 @@ class PostgresLifecycleStore:
 
     # --- sessões e envio -----------------------------------------------------------------
 
-    def open_sessions(self, now: datetime) -> list[int]:
+    def open_sessions(self, now: datetime) -> dict[int, bool]:
+        """Satélite -> a sessão aberta libera transmitir sem Doppler?"""
         with self._engine.connect() as conn:
-            return list(conn.execute(text(f"""
-                SELECT DISTINCT satellite_id FROM {SCHEMA}.uplink_sessions
+            return {row.satellite_id: row.allow_no_doppler for row in conn.execute(text(f"""
+                SELECT satellite_id, bool_or(allow_no_doppler) AS allow_no_doppler
+                FROM {SCHEMA}.uplink_sessions
                 WHERE closed_at IS NULL AND until_time > :now
-            """), {"now": now}).scalars())
+                GROUP BY satellite_id
+            """), {"now": now})}
 
     def awaiting(self, satellite_id: int) -> bool:
         """Há um TC deste satélite no ar esperando resposta?
@@ -253,6 +256,9 @@ class PostgresLifecycleStore:
 
     def mark_sent(self, telecommand_id: int, reply: dict[str, Any], now: datetime) -> bool:
         message = "transmitido; o rádio confirmou a rajada inteira (N1)"
+        if reply.get("doppler_waived"):
+            message = ("transmitido SEM correção de Doppler, na nominal (liberado na sessão manual); "
+                       "o rádio confirmou a rajada inteira (N1)")
         with self._engine.begin() as conn:
             updated = conn.execute(text("""
                 UPDATE telecommands SET status = 'sent', sent_at = :now, status_message = :message
@@ -264,6 +270,7 @@ class PostgresLifecycleStore:
             _log(conn, telecommand_id, "sent", message, {
                 "transmission_id": reply.get("transmission_id"), "evidence": "N1",
                 "tx_freq_hz": reply.get("tx_freq_hz"), "doppler_hz": reply.get("doppler_hz"),
+                "doppler_waived": bool(reply.get("doppler_waived")),
                 "expected_response": reply.get("expected_response_pkt_id"),
             })
         return True

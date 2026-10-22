@@ -40,23 +40,35 @@ class UplinkControl:
         return row.id
 
     def open_session(self, body: Any, now: Optional[datetime] = None) -> dict[str, Any]:
+        """{satellite, duration_s, allow_no_doppler?}.
+
+        `allow_no_doppler` é a liberação explícita do operador para transmitir
+        na nominal quando não houver Doppler (simulador sem órbita, bancada).
+        Sem ela, fora de uma passagem rastreada nada sobe.
+        """
         if not isinstance(body, dict):
             raise ControlError("esperava um objeto JSON {satellite, duration_s}")
         duration = body.get("duration_s", 600)
         if isinstance(duration, bool) or not isinstance(duration, (int, float)) \
                 or not 0 < duration <= self._max_session_s:
             raise ControlError(f"duration_s: de 1 a {self._max_session_s:.0f} s")
+        allow_no_doppler = body.get("allow_no_doppler", False)
+        if not isinstance(allow_no_doppler, bool):
+            raise ControlError("allow_no_doppler: true ou false")
         now = now or datetime.now(timezone.utc)
         with self._engine.begin() as conn:
             satellite_id = self._satellite_id(conn, body.get("satellite"))
             row = conn.execute(text(f"""
-                INSERT INTO {SCHEMA}.uplink_sessions (satellite_id, opened_at, until_time, opened_by)
-                VALUES (:s, :now, :until, :by)
-                RETURNING id, satellite_id, opened_at, until_time
+                INSERT INTO {SCHEMA}.uplink_sessions
+                    (satellite_id, opened_at, until_time, opened_by, allow_no_doppler)
+                VALUES (:s, :now, :until, :by, :allow)
+                RETURNING id, satellite_id, opened_at, until_time, allow_no_doppler
             """), {"s": satellite_id, "now": now, "until": now + timedelta(seconds=duration),
-                   "by": str(body.get("opened_by") or "api")}).mappings().one()
+                   "by": str(body.get("opened_by") or "api"),
+                   "allow": allow_no_doppler}).mappings().one()
         return {"session": {"id": row["id"], "satellite_id": row["satellite_id"],
-                            "opened_at": _iso(row["opened_at"]), "until": _iso(row["until_time"])}}
+                            "opened_at": _iso(row["opened_at"]), "until": _iso(row["until_time"]),
+                            "allow_no_doppler": row["allow_no_doppler"]}}
 
     def close_session(self, session_id: int, now: Optional[datetime] = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
@@ -75,7 +87,7 @@ class UplinkControl:
         now = now or datetime.now(timezone.utc)
         with self._engine.connect() as conn:
             sessions = conn.execute(text(f"""
-                SELECT u.id, s.code, u.opened_at, u.until_time
+                SELECT u.id, s.code, u.opened_at, u.until_time, u.allow_no_doppler
                 FROM {SCHEMA}.uplink_sessions u JOIN satellites s ON s.id = u.satellite_id
                 WHERE u.closed_at IS NULL AND u.until_time > :now
                 ORDER BY u.opened_at
@@ -96,7 +108,8 @@ class UplinkControl:
             """), {"limit": limit}).mappings().all()
         return {
             "sessions": [{"id": s["id"], "satellite": s["code"], "opened_at": _iso(s["opened_at"]),
-                          "until": _iso(s["until_time"])} for s in sessions],
+                          "until": _iso(s["until_time"]),
+                          "allow_no_doppler": s["allow_no_doppler"]} for s in sessions],
             "transmissions": [{**{k: v for k, v in t.items() if k != "ended_at"},
                                "ended_at": _iso(t["ended_at"]),
                                "responses": t["responses"] or []} for t in transmissions],

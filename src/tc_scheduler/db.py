@@ -148,6 +148,10 @@ _CONTROL_DDL = (
         opened_by     TEXT
     )
     """,
+    # Liberação explícita do operador para transmitir sem Doppler (na nominal):
+    # simulador sem órbita e bancada. Numa passagem rastreada nunca vale.
+    f"ALTER TABLE {CONTROL_SCHEMA}.uplink_sessions "
+    f"ADD COLUMN IF NOT EXISTS allow_no_doppler BOOLEAN NOT NULL DEFAULT false",
     # Até onde o ciclo de vida já leu decoded_frames.
     f"""
     CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.tc_lifecycle_state (
@@ -190,7 +194,8 @@ CONTROL_COLUMNS: dict[str, tuple[str, ...]] = {
         "radio", "received_at", "frame_status", "requester_callsign", "echoed_tc_id",
         "error_code", "match_rule", "decision", "matched_at",
     ),
-    "uplink_sessions": ("id", "satellite_id", "opened_at", "until_time", "closed_at", "opened_by"),
+    "uplink_sessions": ("id", "satellite_id", "opened_at", "until_time", "closed_at", "opened_by",
+                        "allow_no_doppler"),
     "tc_lifecycle_state": ("key", "value"),
     "pass_predictions": (
         "satellite_id", "aos_time", "los_time", "culmination_time", "max_elevation_deg",

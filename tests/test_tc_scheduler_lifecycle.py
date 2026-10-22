@@ -139,6 +139,7 @@ class FakeStore:
         self.priority: dict[int, int] = {}
         self.pass_of: dict[int, int | None] = {}
         self.sessions: list[int] = []
+        self.no_doppler_sessions: set[int] = set()   # sessões abertas com allow_no_doppler
         self.saved_cursor = 0
         self.responses: list[tuple[int, int, str]] = []
         self.logs: list[tuple[int, str]] = []
@@ -186,7 +187,7 @@ class FakeStore:
         return True
 
     def open_sessions(self, now):
-        return list(self.sessions)
+        return {sat: sat in self.no_doppler_sessions for sat in self.sessions}
 
     def awaiting(self, satellite_id):
         return any(s == "sent" and self.satellite_of[tc] == satellite_id for tc, s in self.status.items())
@@ -216,9 +217,11 @@ class FakeUplink:
     def __init__(self, *replies) -> None:
         self.replies = list(replies)
         self.calls: list[int] = []
+        self.allowed: list[bool] = []
 
-    def transmit(self, telecommand_id):
+    def transmit(self, telecommand_id, allow_no_doppler=False):
         self.calls.append(telecommand_id)
+        self.allowed.append(allow_no_doppler)
         reply = self.replies.pop(0) if self.replies else ack()
         if isinstance(reply, Exception):
             raise reply
@@ -252,6 +255,46 @@ def test_sessao_manual_transmite_e_resposta_confirma():
 
     assert report.matched == 1 and store.status[1] == "confirmed"
     assert store.saved_cursor == 10
+
+
+def test_passagem_rastreada_nunca_libera_transmitir_sem_doppler():
+    store, uplink = FakeStore(), FakeUplink()
+    store.add_tc(1, status="queued", pass_id=3)
+
+    lifecycle(store, uplink).tick(T0, {"id": 3, "satellite_id": 7})
+
+    assert uplink.calls == [1] and uplink.allowed == [False]
+
+
+def test_sessao_manual_so_libera_sem_doppler_se_o_operador_liberou():
+    store, uplink = FakeStore(), FakeUplink()
+    store.add_tc(1, sat=7)
+    store.add_tc(2, sat=8)
+    store.sessions = [7, 8]
+    store.no_doppler_sessions = {8}
+
+    lifecycle(store, uplink).tick(T0, None)
+
+    assert dict(zip(uplink.calls, uplink.allowed)) == {1: False, 2: True}
+
+
+def test_sem_doppler_o_tc_fica_na_fila_e_tenta_de_novo():
+    """O Doppler pode voltar (o Station Manager reiniciou, a passagem começou):
+    a recusa é falha de rádio, não `failed`."""
+    store = FakeStore()
+    store.add_tc(1)
+    store.sessions = [7]
+    uplink = FakeUplink({"ok": False, "error": "no_doppler", "detail": "sem Doppler anunciado"})
+    loop = lifecycle(store, uplink)
+
+    report = loop.tick(T0, None)
+    assert report.tx_failed == [1] and store.status[1] == "pending"
+    assert store.logs == [(1, "no_doppler")]
+
+    loop.tick(T0 + timedelta(seconds=5), None)
+    assert uplink.calls == [1]                          # espera o prazo de nova tentativa
+    loop.tick(T0 + timedelta(seconds=16), None)
+    assert uplink.calls == [1, 1] and store.status[1] == "sent"
 
 
 def test_um_tc_por_vez_o_proximo_so_depois_da_resposta():
