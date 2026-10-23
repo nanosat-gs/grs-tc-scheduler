@@ -219,6 +219,9 @@ class Lifecycle:
         # Satélite -> quando pode tentar de novo depois de uma falha de rádio.
         # Em memória de propósito: um restart do Scheduler pode tentar de novo.
         self._retry_at: dict[int, datetime] = {}
+        # Satélites cuja sessão manual está esperando a passagem de outro
+        # acabar: só para logar uma vez, e não a cada tick.
+        self._held: set[int] = set()
 
     def tick(self, now: datetime, active_pass: Optional[dict[str, Any]]) -> TickReport:
         report = TickReport()
@@ -272,7 +275,19 @@ class Lifecycle:
         if active_pass is not None:
             sessions[active_pass["satellite_id"]] = (active_pass["id"], False)
         for satellite_id, allow_no_doppler in self._store.open_sessions(now).items():
+            # Com uma passagem em andamento, a antena aponta para o satélite
+            # dela, e o Doppler anunciado (doppler.vhf, por rádio e não por
+            # satélite) é o dele. Uma sessão de outro satélite espera o LOS:
+            # sairia com o Doppler errado e na direção errada.
+            if active_pass is not None and satellite_id != active_pass["satellite_id"]:
+                if satellite_id not in self._held:
+                    logger.info("Sessão de uplink do satélite %d espera: a passagem do %d está "
+                                "em andamento.", satellite_id, active_pass["satellite_id"])
+                self._held.add(satellite_id)
+                continue
             sessions[satellite_id] = (None, allow_no_doppler)
+        if active_pass is None:
+            self._held.clear()
 
         for satellite_id, (pass_id, allow_no_doppler) in sessions.items():
             retry_at = self._retry_at.get(satellite_id)

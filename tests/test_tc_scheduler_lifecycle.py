@@ -278,6 +278,33 @@ def test_sessao_manual_so_libera_sem_doppler_se_o_operador_liberou():
     assert dict(zip(uplink.calls, uplink.allowed)) == {1: False, 2: True}
 
 
+def test_sessao_de_outro_satelite_espera_a_passagem_em_andamento():
+    """A antena e o Doppler anunciado são do satélite da passagem: a sessão de
+    outro satélite, mesmo liberada sem Doppler, só sobe depois do LOS."""
+    store, uplink = FakeStore(), FakeUplink()
+    store.add_tc(1, sat=7, status="queued", pass_id=3)
+    store.add_tc(2, sat=8)
+    store.sessions = [8]
+    store.no_doppler_sessions = {8}
+    loop = lifecycle(store, uplink)
+
+    loop.tick(T0, {"id": 3, "satellite_id": 7})
+    assert uplink.calls == [1]                          # só o da passagem
+
+    loop.tick(T0 + timedelta(seconds=40), None)         # depois do LOS
+    assert uplink.calls == [1, 2] and uplink.allowed == [False, True]
+
+
+def test_sessao_do_mesmo_satelite_da_passagem_usa_o_doppler_dela():
+    store, uplink = FakeStore(), FakeUplink()
+    store.add_tc(1, sat=7)
+    store.sessions = [7]
+
+    lifecycle(store, uplink).tick(T0, {"id": 3, "satellite_id": 7})
+
+    assert uplink.calls == [1] and uplink.allowed == [False]
+
+
 def test_sem_doppler_o_tc_fica_na_fila_e_tenta_de_novo():
     """O Doppler pode voltar (o Station Manager reiniciou, a passagem começou):
     a recusa é falha de rádio, não `failed`."""
