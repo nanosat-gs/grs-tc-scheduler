@@ -117,7 +117,7 @@ _CONTROL_DDL = (
     f"""
     CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.tc_responses (
         id                 BIGSERIAL PRIMARY KEY,
-        telecommand_id     INTEGER NOT NULL REFERENCES telecommands(id) ON DELETE CASCADE,
+        telecommand_id     INTEGER NOT NULL REFERENCES telecommands(id) ON DELETE RESTRICT,
         transmission_id    BIGINT NOT NULL,
         decoded_frame_id   BIGINT NOT NULL UNIQUE,
         raw_packet_id      BIGINT NOT NULL,
@@ -135,6 +135,24 @@ _CONTROL_DDL = (
     """,
     f"CREATE INDEX IF NOT EXISTS tc_responses_telecommand_idx "
     f"ON {CONTROL_SCHEMA}.tc_responses (telecommand_id, received_at)",
+    # A resposta casada é a prova do desfecho do TC: apagar o TC não pode
+    # apagá-la (RESTRICT). Um banco antigo, criado com CASCADE, é corrigido
+    # aqui; só mexe se a constraint ainda não for RESTRICT.
+    f"""
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'tc_responses_telecommand_id_fkey'
+                     AND conrelid = '{CONTROL_SCHEMA}.tc_responses'::regclass
+                     AND confdeltype <> 'r') THEN
+            ALTER TABLE {CONTROL_SCHEMA}.tc_responses
+                DROP CONSTRAINT tc_responses_telecommand_id_fkey;
+            ALTER TABLE {CONTROL_SCHEMA}.tc_responses
+                ADD CONSTRAINT tc_responses_telecommand_id_fkey FOREIGN KEY (telecommand_id)
+                REFERENCES telecommands(id) ON DELETE RESTRICT;
+        END IF;
+    END $$
+    """,
     # Sessão de uplink aberta pelo operador fora de uma passagem planejada
     # (contato manual, ou o simulador sem esperar uma passagem real). A API
     # escreve, o laço lê: as duas threads não compartilham objeto nenhum.

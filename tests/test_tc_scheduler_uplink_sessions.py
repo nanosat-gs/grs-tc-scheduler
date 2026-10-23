@@ -146,3 +146,46 @@ def test_banco_antigo_ganha_a_coluna_no_boot(engine):
               AND column_name = 'allow_no_doppler'
         """)).one()
     assert column.column_default == "false" and column.is_nullable == "NO"
+
+
+def test_tc_com_resposta_nao_pode_ser_apagado_e_banco_antigo_e_corrigido(engine):
+    """A resposta casada é prova: a FK recusa apagar o TC (RESTRICT). Um banco
+    criado com CASCADE vira RESTRICT no boot, e o boot seguinte não mexe."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    from tc_scheduler import db
+
+    def delete_rule():
+        with engine.connect() as conn:
+            return conn.execute(text("""
+                SELECT confdeltype FROM pg_constraint
+                WHERE conname = 'tc_responses_telecommand_id_fkey'
+            """)).scalar_one()
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            ALTER TABLE mission_control.tc_responses DROP CONSTRAINT tc_responses_telecommand_id_fkey;
+            ALTER TABLE mission_control.tc_responses ADD CONSTRAINT tc_responses_telecommand_id_fkey
+                FOREIGN KEY (telecommand_id) REFERENCES telecommands(id) ON DELETE CASCADE
+        """))
+    assert delete_rule() == "c"
+    db.ensure_control_schema(engine)
+    db.ensure_control_schema(engine)
+    assert delete_rule() == "r"
+
+    with engine.begin() as conn:
+        tc = conn.execute(text("""
+            INSERT INTO telecommands (satellite_id, operator_id, command_type, status)
+            SELECT (SELECT min(id) FROM satellites), (SELECT min(id) FROM operators), 'PING', 'confirmed'
+            RETURNING id
+        """)).scalar_one()
+        conn.execute(text("""
+            INSERT INTO mission_control.tc_responses
+                (telecommand_id, transmission_id, decoded_frame_id, raw_packet_id, pkt_id,
+                 received_at, frame_status, requester_callsign, match_rule, decision)
+            VALUES (:tc, 1, 1, 1, 2, now(), 'ok', 'PY0SIM', 'callsign', 'confirmed')
+        """), {"tc": tc})
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM telecommands WHERE id = :tc"), {"tc": tc})
