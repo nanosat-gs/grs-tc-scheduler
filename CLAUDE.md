@@ -76,6 +76,16 @@ porque o painel busca a cada 15 s e degrada em vez de falhar. Se algum dia
 incomodar, `api.py` **já é executável sozinho** (`python -m tc_scheduler.api`):
 a saída é um serviço a mais no compose, mesma imagem, sem tocar em código.
 
+## O ciclo de vida do TC tem a sua thread
+
+Com `UPLINK_ENABLED`, o `tc_lifecycle` roda em `lifecycle_runner.py`, thread
+própria e engine próprio, e não no laço principal. O pedido ao `grs-uplink`
+espera a rajada sair e o rádio confirmar (até `UPLINK_REQUEST_TIMEOUT_MS`):
+no laço, isso segurava a ativação da próxima passagem. A thread lê do banco
+qual passagem está ativa a cada tick; o um-TC-por-vez continua valendo porque
+casar, vencer prazos e enviar seguem em sequência nela. Não chame o atributo
+de parada de `_stop`: é método interno do `threading.Thread`.
+
 ## Armadilhas
 
 - **`STATION_RADIOS` aqui só informa o painel.** Quem roteia downlink para

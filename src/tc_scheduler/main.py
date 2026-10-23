@@ -37,7 +37,7 @@ from spacelab_tracking import (
 )
 
 from tc_scheduler import config, db, schema_check
-from tc_scheduler.tc_lifecycle import Lifecycle
+from tc_scheduler.lifecycle_runner import LifecycleRunner
 from tc_scheduler.planner import (
     PassCandidate,
     is_worth_tracking,
@@ -106,13 +106,11 @@ def find_decision(decisions: list[dict], satellite_id: int, aos: datetime) -> Op
 
 
 class Scheduler:
-    def __init__(self, engine, station: StationManagerClient,
-                 lifecycle: Optional[Lifecycle] = None) -> None:
-        # Com uplink: manda, espera a resposta e fecha cada TC (tc_lifecycle.py).
-        # Sem: o `sent` continua sendo inferido no fim da passagem.
-        self._lifecycle = lifecycle
-        self._lifecycle_error: Optional[str] = None
-        self._lifecycle_error_at = 0.0
+    def __init__(self, engine, station: StationManagerClient, uplink_enabled: bool = False) -> None:
+        # Com uplink, quem manda e fecha cada TC é o ciclo de vida, na thread
+        # dele (lifecycle_runner.py); aqui só muda o que acontece no LOS. Sem
+        # uplink, o `sent` continua sendo inferido no fim da passagem.
+        self._uplink_enabled = uplink_enabled
         self._engine = engine
         self._station = station
         self._last_replan = 0.0
@@ -318,7 +316,7 @@ class Scheduler:
             finished = db.close_finished_passes(conn, now)
             for pass_id in finished:
                 logger.info("Passagem %d concluída.", pass_id)
-            if finished and self._lifecycle is not None:
+            if finished and self._uplink_enabled:
                 # Com uplink, `sent` só vem do ack do rádio. O que a janela não
                 # chegou a transmitir volta para a fila da próxima passagem.
                 released = db.release_telecommands(conn, finished)
@@ -351,25 +349,6 @@ class Scheduler:
             self._activate(to_activate)
         elif active is not None:
             self._ensure_still_tracking(active)
-
-        if self._lifecycle is not None:
-            # Fora da transação acima: o pedido ao uplink espera a rajada sair.
-            self._tick_lifecycle(now, active)
-
-    def _tick_lifecycle(self, now: datetime, active: Optional[dict]) -> None:
-        """O ciclo de vida não pode derrubar o rastreio. E, com o decoder ou o
-        grs-uplink fora do ar, a mesma falha se repetiria a cada tick: loga
-        uma vez por minuto, e quando muda."""
-        try:
-            self._lifecycle.tick(now, active)
-            if self._lifecycle_error is not None:
-                logger.info("Ciclo de vida do TC voltou a funcionar.")
-                self._lifecycle_error = None
-        except Exception as error:
-            message = f"{type(error).__name__}: {error}".splitlines()[0][:300]
-            if message != self._lifecycle_error or time.monotonic() - self._lifecycle_error_at > 60:
-                logger.warning("Ciclo de vida do TC falhou (%s); tentando no próximo tick.", message)
-                self._lifecycle_error, self._lifecycle_error_at = message, time.monotonic()
 
     def _activate(self, scheduled_pass: dict) -> None:
         name = scheduled_pass["satellite_name"]
@@ -489,8 +468,18 @@ def main() -> None:
     station = StationManagerClient(
         config.STATION_MANAGER_ADDRESS, config.ZMQ_REQUEST_TIMEOUT_MS
     )
-    lifecycle, uplink = _build_lifecycle(engine)
-    scheduler = Scheduler(engine, station, lifecycle)
+    # Engine próprio para o ciclo de vida, que roda na thread dele: o pedido ao
+    # grs-uplink espera a rajada sair e não pode segurar a ativação de passagens.
+    lifecycle_engine = db.build_engine(config.DATABASE_URL) if config.UPLINK_ENABLED else None
+    lifecycle, uplink = _build_lifecycle(lifecycle_engine)
+    runner = None
+    if lifecycle is not None:
+        def active_pass():
+            with lifecycle_engine.connect() as conn:
+                return db.fetch_active_pass(conn)
+        runner = LifecycleRunner(lifecycle, active_pass, config.TICK_SECONDS)
+        runner.start()
+    scheduler = Scheduler(engine, station, uplink_enabled=lifecycle is not None)
 
     api_data = None
     if config.API_ENABLED and not args.no_api:
@@ -503,9 +492,14 @@ def main() -> None:
     try:
         scheduler.run()
     finally:
+        if runner is not None:
+            runner.stop()
+            runner.join(timeout=config.UPLINK_REQUEST_TIMEOUT_MS / 1000 + 5)
         station.close()
         if uplink is not None:
             uplink.close()
+        if lifecycle_engine is not None:
+            lifecycle_engine.dispose()
         engine.dispose()
         if api_data is not None:
             api_data.close()
@@ -520,7 +514,7 @@ def _build_lifecycle(engine):
     from datetime import timedelta
 
     from tc_scheduler.lifecycle_store import PostgresLifecycleStore
-    from tc_scheduler.tc_lifecycle import PING_ANSWER, TC_FEEDBACK, LifecycleSettings
+    from tc_scheduler.tc_lifecycle import PING_ANSWER, TC_FEEDBACK, Lifecycle, LifecycleSettings
     from tc_scheduler.uplink_client import UplinkClient
 
     uplink = UplinkClient(config.UPLINK_ADDRESS, config.UPLINK_REQUEST_TIMEOUT_MS)
