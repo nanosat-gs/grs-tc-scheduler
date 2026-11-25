@@ -132,6 +132,20 @@ def create_app(station_data: Any, control: Any = None, uplink: Any = None) -> Fl
             return jsonify({"error": f"satélite {code} não encontrado"}), 404
         return jsonify(detail)
 
+    @app.get("/api/simulated-pass")
+    def simulated_pass():
+        """A janela simulada em curso, ou a próxima, com o TLE dela.
+
+        `{"simulated_pass": null}` quando não há nenhuma. Quem consome é o rádio
+        da bancada: com o mesmo TLE, ele aplica ao FS-2 parado o Doppler que a
+        estação corrige (ver simulated_pass.py).
+        """
+        try:
+            return jsonify({"simulated_pass": station_data.simulated_pass()})
+        except Exception as error:
+            logger.warning("Sem dados da passagem simulada: %s", error)
+            return jsonify({"error": "banco indisponível"}), 503
+
     # --- uplink: sessões manuais e o que subiu (uplink_control.py) ---------------
 
     @app.get("/api/uplink")

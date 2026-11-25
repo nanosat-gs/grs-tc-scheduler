@@ -63,6 +63,20 @@ _PASSES_SQL = """
     ORDER BY p.aos_time
 """
 
+# A janela simulada em curso, ou a próxima, com a órbita dela (ver
+# simulated_pass.py). O schema `mission_control` é do Scheduler.
+_SIMULATED_PASS_SQL = """
+    SELECT p.id, p.status, p.aos_time, p.culmination_time, p.los_time, p.max_elevation_deg,
+           s.code, s.name, sp.tle_line1, sp.tle_line2, sp.orbit_name, sp.shift_s,
+           sp.original_aos
+    FROM mission_control.simulated_passes sp
+    JOIN scheduled_passes p ON p.id = sp.pass_id
+    JOIN satellites s ON s.id = p.satellite_id
+    WHERE p.status IN ('planned', 'active') AND p.los_time > now()
+    ORDER BY p.aos_time
+    LIMIT 1
+"""
+
 # Só quem tem NORAD ID entra na revalidação: um satélite de TLE manual não tem
 # o que buscar no catálogo, e um sem dado orbital nenhum não é rastreável.
 _TRACKABLE_SQL = """
@@ -365,6 +379,35 @@ class StationData:
         with self._cache_lock:
             self._satrec_cache[code] = (satrec, time.monotonic())
         return satrec
+
+    def simulated_pass(self) -> Optional[dict[str, Any]]:
+        """A janela simulada em curso ou à espera do AOS, com o TLE dela; None sem nenhuma.
+
+        É por aqui que o rádio da bancada (o simulador no Pi, depois o
+        adaptador do Pluto) pega a órbita para aplicar ao FS-2 parado o mesmo
+        Doppler que a estação corrige. Falha de banco sobe: a rota responde 503,
+        e "sem passagem simulada" continua distinguível de "não sei".
+        """
+        from sqlalchemy import text
+
+        with self._engine.connect() as conn:
+            row = conn.execute(text(_SIMULATED_PASS_SQL)).mappings().first()
+        if row is None:
+            return None
+        return {
+            "pass_id": row["id"],
+            "status": row["status"],
+            "satellite_code": row["code"],
+            "satellite_name": row["name"],
+            "aos_time": _isoformat(row["aos_time"]),
+            "culmination_time": _isoformat(row["culmination_time"]),
+            "los_time": _isoformat(row["los_time"]),
+            "max_elevation_degrees": row["max_elevation_deg"],
+            "tle": [row["tle_line1"], row["tle_line2"]],
+            "orbit_name": row["orbit_name"],
+            "shift_s": row["shift_s"],
+            "original_aos": _isoformat(row["original_aos"]),
+        }
 
     def is_available(self) -> bool:
         """O banco responde? Usado só pelo /health da API.

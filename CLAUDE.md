@@ -40,6 +40,7 @@ que é deste serviço (criado no boot por `db.ensure_control_schema`):
 | `satellite_downlinks` | As portadoras do satélite: nome, frequência, ligado, ordem, e o erro do oscilador medido pelo ajuste fino (`measured_offset_hz`, `measured_at`) — guardado durante a passagem só depois de a malha convergir (`db.afc_converged`), mantido ao editar sem mudar a frequência. `PUT /api/satellites/<code>/downlinks` substitui a lista inteira (a ordem importa: o primeiro ligado é a referência do Doppler) |
 | `pass_decisions` | `skip` ou `force` numa passagem. Desfazer = apagar a linha |
 | `pass_predictions` | Resultado do último replanejamento, **todas** as candidatas: `planned`, `conflict` (com quem venceu), `skipped`, `reception_off`. É como a API mostra as que perderam sem compartilhar memória com o laço |
+| `simulated_passes` | A órbita de cada janela simulada (`station_demo.py simulate-pass --proxima`): o TLE deslocado, de quem é a órbita e o deslocamento. Uma linha por `scheduled_passes.id` |
 
 **A passagem é identificada por satélite + AOS previsto**, casados com
 tolerância de ±10 min (`PASS_MATCH_TOLERANCE`) — nunca pelo id: as linhas
@@ -52,6 +53,35 @@ tela em segundos, sem esperar o ciclo de 5 min.
 
 Com `track_passes` desligado, o satélite volta ao comportamento antigo: só
 entra a passagem que leva telecomando, ou a que o operador forçou.
+
+## Passagem simulada (bancada RF)
+
+Na bancada o FS-2 fica parado em cima da mesa, do Pi com o Si4463 até os
+PlutoSDR (etapas 1 a 3). `simulate-pass --proxima` traz para agora a
+próxima passagem real de uma órbita (`simulated_pass.py`).
+
+**A passagem simulada é um TLE, não um relógio adiantado.** A época recua Δ
+e o nodo gira junto com a Terra (a diferença de GMST no intervalo). Visto
+da estação, o TLE deslocado é a mesma passagem, a menos de 0,01° e 1 Hz
+(há teste). Quem precisa dela faz a conta com o próprio relógio NTP:
+- a estação, pelo `track_satellite`;
+- o rádio da bancada, por `GET /api/simulated-pass`, para aplicar o mesmo
+  Doppler ao FS-2 parado.
+
+Um relógio adiantado só funcionaria com todos adiantados igual; é o que
+impede o uplink no modo `next-pass` do `grs-sdr-sim`. A órbita pode ser
+emprestada (`--orbita-de`): o FS-2 ainda não tem TLE.
+
+- **Na ativação, a órbita da janela tem precedência** sobre a do satélite
+  (`load_orbital_data` lê `simulated_tle_*`, que as consultas de ativação
+  trazem). Uma janela simulada é assumida antes de uma real que caia por
+  cima, e a real termina `missed`.
+- **O replanejamento não apaga a janela simulada `planned`**, nem solta os
+  TCs dela (`clear_planned_passes`). Sem isso, um replan entre a criação e o
+  AOS a faria sumir sem aviso.
+- **Janela simulada não grava o erro do oscilador.** O FS-2 da bancada está
+  parado: o que o ajuste fino aprende ali é o Doppler que o sinal não tem, e
+  gravá-lo poria um `measured_offset_hz` falso no painel.
 
 ## O único escritor do banco
 

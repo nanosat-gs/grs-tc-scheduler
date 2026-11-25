@@ -58,6 +58,7 @@ não tem autenticação.
 | `POST` | `/api/uplink/session` | Com uplink: `{"satellite": código ou id, "duration_s"}` abre uma sessão manual de uplink (contato fora de passagem, ou o simulador) |
 | `DELETE` | `/api/uplink/session/<id>` | Fecha a sessão |
 | `GET` | `/api/uplink` | Sessões abertas e as últimas transmissões, com o status do TC e as respostas casadas |
+| `GET` | `/api/simulated-pass` | A passagem simulada em curso, ou a próxima, com o TLE dela; `null` sem nenhuma |
 
 Erros das ações: 400 pedido inválido, 404 satélite inexistente, 503 banco fora.
 
@@ -79,7 +80,18 @@ Observar e exercitar:
 python -m tc_scheduler.monitor --watch
 python tools/station_demo.py prepare --code SAT-001 --norad-id 44885
 python tools/station_demo.py simulate-pass --code SAT-001
+python tools/station_demo.py simulate-pass --code FS-2 --proxima                     # uma passagem real, começando agora
+python tools/station_demo.py simulate-pass --code FS-2 --proxima --elevacao-min 60
 ```
+
+O `simulate-pass` sem `--proxima` abre uma janela com a posição do satélite
+naquele instante, que quase sempre está abaixo do horizonte. Com `--proxima`,
+a janela é a próxima passagem real, com elevação máxima de pelo menos
+`--elevacao-min` (padrão 30°), trazida para agora: ângulos, duração e curva de
+Doppler de verdade. A órbita da janela é um TLE deslocado no tempo, e é ele
+que vai ao Station Manager. Um satélite sem órbita, como o FS-2 na bancada,
+usa a de outro: `--orbita-de <NORAD>`, padrão o FloripaSat-1 (44885). O TLE
+fica em `GET /api/simulated-pass`. Ver `src/tc_scheduler/simulated_pass.py`.
 
 As variáveis estão comentadas no [.env.example](.env.example). As `GS_*`
 precisam bater com as do Station Manager, e `STATION_RADIOS` aqui só informa ao

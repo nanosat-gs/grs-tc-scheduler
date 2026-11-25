@@ -62,7 +62,15 @@ def load_orbital_data(satellite: dict):
 
     Um TLE preenchido à mão é uma decisão explícita de operador — sobrepor isso
     com o catálogo público anularia o motivo de tê-lo preenchido.
+
+    Numa janela simulada (as consultas de ativação trazem `simulated_tle_*`),
+    vale a órbita dela: é a que faz a passagem acontecer agora, e pode ser
+    emprestada de outro satélite (o FS-2 ainda não tem TLE).
     """
+    if satellite.get("simulated_tle_line1") and satellite.get("simulated_tle_line2"):
+        return from_tle_lines(
+            satellite["simulated_tle_line1"], satellite["simulated_tle_line2"], satellite["name"]
+        )
     if satellite.get("tle_line1") and satellite.get("tle_line2"):
         return from_tle_lines(
             satellite["tle_line1"], satellite["tle_line2"], satellite["name"]
@@ -400,7 +408,11 @@ class Scheduler:
             return
 
         # O ajuste fino aprende o erro do oscilador durante a passagem; guardá-lo
-        # é o que deixa o painel sugerir a frequência corrigida depois.
+        # é o que deixa o painel sugerir a frequência corrigida depois. Numa
+        # janela simulada, não: o FS-2 da bancada está parado, e o que a malha
+        # aprende ali é o Doppler que o sinal não tem, não o oscilador.
+        if active.get("simulated"):
+            return
         try:
             with self._engine.begin() as conn:
                 db.record_measured_offsets(conn, active["satellite_id"],

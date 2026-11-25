@@ -195,6 +195,19 @@ _CONTROL_DDL = (
         computed_at          TIMESTAMPTZ NOT NULL
     )
     """,
+    # Janela simulada (tools/station_demo.py simulate-pass --proxima): a órbita
+    # dela é este TLE, e não a do satélite. Ver simulated_pass.py.
+    f"""
+    CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.simulated_passes (
+        pass_id       INTEGER PRIMARY KEY REFERENCES scheduled_passes(id) ON DELETE CASCADE,
+        tle_line1     TEXT NOT NULL,
+        tle_line2     TEXT NOT NULL,
+        orbit_name    TEXT NOT NULL,
+        shift_s       DOUBLE PRECISION NOT NULL,
+        original_aos  TIMESTAMPTZ NOT NULL,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
 )
 
 # Colunas das tabelas próprias, conferidas no boot pelo schema_check.
@@ -220,6 +233,8 @@ CONTROL_COLUMNS: dict[str, tuple[str, ...]] = {
         "outcome", "lost_to_satellite_id", "lost_to_aos_time", "forced",
         "carries_telecommands", "telecommand_count", "computed_at",
     ),
+    "simulated_passes": ("pass_id", "tle_line1", "tle_line2", "orbit_name", "shift_s",
+                         "original_aos", "created_at"),
 }
 
 
@@ -426,6 +441,19 @@ def fetch_station_overview(conn: Connection) -> dict[str, Any]:
     return {"satellites": satellites, "plan": plan, "telecommand_counts": counts}
 
 
+# Os downlinks ligados do satélite, em ordem: vão no `track_satellite`.
+_DOWNLINKS_COLUMN = f"""(SELECT COALESCE(json_agg(json_build_object('name', d.name,
+                                                          'frequency_hz', d.frequency_hz)
+                                        ORDER BY d.position, d.id), '[]'::json)
+                FROM {CONTROL_SCHEMA}.satellite_downlinks d
+                WHERE d.satellite_id = s.id AND d.enabled) AS downlinks"""
+
+# A órbita da janela simulada, quando a passagem é uma (LEFT JOIN `sp`).
+# `load_orbital_data` dá precedência a ela sobre a do satélite.
+_SIMULATED_COLUMNS = """(sp.pass_id IS NOT NULL) AS simulated,
+               sp.tle_line1 AS simulated_tle_line1, sp.tle_line2 AS simulated_tle_line2"""
+
+
 def fetch_pass_to_activate(conn: Connection, now: datetime) -> Optional[dict[str, Any]]:
     """Passagem planejada cuja janela já começou e ainda não terminou.
 
@@ -435,21 +463,22 @@ def fetch_pass_to_activate(conn: Connection, now: datetime) -> Optional[dict[str
     `name` além de `satellite_name`: `load_orbital_data` lê `name` para montar
     os dados de um TLE manual. Sem ele, todo satélite de TLE manual falhava
     ao ser assumido e a passagem virava 'cancelled'.
+
+    Uma janela simulada vem primeiro: o operador a pediu agora, e uma
+    passagem real que caia por cima dela termina 'missed'.
     """
     row = conn.execute(text(f"""
         SELECT p.id, p.satellite_id, p.aos_time, p.los_time, p.max_elevation_deg,
                s.name, s.name AS satellite_name, s.norad_id, s.tle_line1, s.tle_line2,
-               (SELECT COALESCE(json_agg(json_build_object('name', d.name,
-                                                          'frequency_hz', d.frequency_hz)
-                                        ORDER BY d.position, d.id), '[]'::json)
-                FROM {CONTROL_SCHEMA}.satellite_downlinks d
-                WHERE d.satellite_id = s.id AND d.enabled) AS downlinks
+               {_SIMULATED_COLUMNS},
+               {_DOWNLINKS_COLUMN}
         FROM scheduled_passes p
         JOIN satellites s ON s.id = p.satellite_id
+        LEFT JOIN {CONTROL_SCHEMA}.simulated_passes sp ON sp.pass_id = p.id
         WHERE p.status = 'planned'
           AND p.aos_time <= :now
           AND p.los_time > :now
-        ORDER BY p.aos_time
+        ORDER BY (sp.pass_id IS NULL), p.aos_time
         LIMIT 1
     """), {"now": now}).mappings().first()
     return dict(row) if row else None
@@ -459,13 +488,11 @@ def fetch_active_pass(conn: Connection) -> Optional[dict[str, Any]]:
     row = conn.execute(text(f"""
         SELECT p.id, p.satellite_id, p.aos_time, p.los_time,
                s.name, s.name AS satellite_name, s.norad_id, s.tle_line1, s.tle_line2,
-               (SELECT COALESCE(json_agg(json_build_object('name', d.name,
-                                                          'frequency_hz', d.frequency_hz)
-                                        ORDER BY d.position, d.id), '[]'::json)
-                FROM {CONTROL_SCHEMA}.satellite_downlinks d
-                WHERE d.satellite_id = s.id AND d.enabled) AS downlinks
+               {_SIMULATED_COLUMNS},
+               {_DOWNLINKS_COLUMN}
         FROM scheduled_passes p
         JOIN satellites s ON s.id = p.satellite_id
+        LEFT JOIN {CONTROL_SCHEMA}.simulated_passes sp ON sp.pass_id = p.id
         WHERE p.status = 'active'
         ORDER BY p.aos_time
         LIMIT 1
@@ -524,17 +551,61 @@ def clear_planned_passes(conn: Connection) -> int:
 
     O status volta a 'pending' explicitamente: o ON DELETE SET NULL da FK zera
     o vínculo, mas deixaria o status em 'queued'.
+
+    A janela simulada ainda não iniciada fica, com os telecomandos dela: não
+    saiu do plano, e sim de um pedido do operador para agora. Apagá-la no
+    replanejamento que cai entre a criação e o AOS a faria sumir sem aviso.
     """
-    conn.execute(text("""
+    not_simulated = f"""NOT EXISTS (SELECT 1 FROM {CONTROL_SCHEMA}.simulated_passes sp
+                                 WHERE sp.pass_id = p.id)"""
+    conn.execute(text(f"""
         UPDATE telecommands
         SET status = 'pending', scheduled_pass_id = NULL
         WHERE status = 'queued'
           AND scheduled_pass_id IN (
-              SELECT id FROM scheduled_passes
-              WHERE status IN ('planned', 'cancelled', 'missed')
+              SELECT p.id FROM scheduled_passes p
+              WHERE p.status IN ('cancelled', 'missed')
+                 OR (p.status = 'planned' AND {not_simulated})
           )
     """))
-    return conn.execute(text("DELETE FROM scheduled_passes WHERE status = 'planned'")).rowcount
+    return conn.execute(text(f"""
+        DELETE FROM scheduled_passes p WHERE p.status = 'planned' AND {not_simulated}
+    """)).rowcount
+
+
+def insert_simulated_pass(conn: Connection, satellite_id: int, simulated, data_source: str,
+                          message: str) -> int:
+    """Uma janela simulada (`simulated_pass.SimulatedPass`) e a órbita dela."""
+    satellite_pass = simulated.satellite_pass
+    pass_id = conn.execute(text("""
+        INSERT INTO scheduled_passes (
+            satellite_id, aos_time, los_time, culmination_time,
+            max_elevation_deg, aos_azimuth_deg, los_azimuth_deg,
+            data_source, status, status_message
+        ) VALUES (
+            :satellite_id, :aos_time, :los_time, :culmination_time,
+            :max_elevation_deg, :aos_azimuth_deg, :los_azimuth_deg,
+            :data_source, 'planned', :message
+        ) RETURNING id
+    """), {
+        "satellite_id": satellite_id,
+        "aos_time": satellite_pass.aos_time,
+        "los_time": satellite_pass.los_time,
+        "culmination_time": satellite_pass.culmination_time,
+        "max_elevation_deg": satellite_pass.max_elevation_deg,
+        "aos_azimuth_deg": satellite_pass.aos_azimuth_deg,
+        "los_azimuth_deg": satellite_pass.los_azimuth_deg,
+        "data_source": data_source,
+        "message": message,
+    }).scalar_one()
+    conn.execute(text(f"""
+        INSERT INTO {CONTROL_SCHEMA}.simulated_passes
+            (pass_id, tle_line1, tle_line2, orbit_name, shift_s, original_aos)
+        VALUES (:pass_id, :line1, :line2, :orbit_name, :shift_s, :original_aos)
+    """), {"pass_id": pass_id, "line1": simulated.tle_line1, "line2": simulated.tle_line2,
+           "orbit_name": simulated.orbit_name, "shift_s": simulated.shift_s,
+           "original_aos": simulated.original_aos})
+    return pass_id
 
 
 def insert_planned_pass(conn: Connection, satellite_id: int, satellite_pass, tle_epoch,
